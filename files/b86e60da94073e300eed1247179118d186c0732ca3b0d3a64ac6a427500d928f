@@ -1,0 +1,188 @@
+// Speech recognition for the lyrics (Whisper base, WASM, one thread), fed with the separated
+// vocals (or the tab audio in light mode) at 16 kHz with wall-clock times.
+//
+// It only works as much as it is asked to:
+//   mode 'align': the lyrics are known; recognise a 10 s window now and then (often while the
+//                 timing is uncertain, rarely once it is sure) to anchor them and to notice
+//                 parts sung differently
+//   mode 'live':  no lyrics anywhere; recognise everything, window after window
+//   mode 'off':   nothing
+// Windows without singing are skipped. Models ship with the extension (no download).
+import { MelStream, Tokenizer, Whisper, SR } from '../lib/asr/whisper.js';
+
+let base = '';
+let whisper = null;
+let loading = null;
+let mode = 'off';
+let intensity = 'low';
+let prompt = '';
+let lang = null;
+let ms = null; // MelStream
+let wall0 = 0; // wall time (ms) of mel frame 0
+let lastWall = 0; // wall time (ms) just after the last sample pushed
+let nextAt = 0; // next window start (frame), live mode
+let lastRunFrames = -1e9; // align mode: frame count at the last run
+let busy = false;
+let busyMs = 0;
+let lastRunMs = 0; // how long the last window took (ms)
+let restUntil = 0; // performance.now() before which no new window starts (duty-cycle cap)
+let highRuns = 0; // windows run at high intensity for the current song
+let lastText = ''; // live mode: what was heard last (keeps the spelling consistent)
+const livePrompt = () => lastText;
+let statStart = performance.now();
+const WIN = 1000; // frames (10 s)
+const LIVE_MIN = 600; // live mode: transcribe once 6 s of new audio are there
+
+async function load() {
+	if (whisper) return whisper;
+	if (loading) return loading;
+	loading = (async () => {
+		const ort = await import(base + 'ort/ort.webgpu.min.mjs');
+		ort.env.wasm.wasmPaths = base + 'ort/';
+		ort.env.wasm.numThreads = 1;
+		ort.env.logLevel = 'error';
+		const get = async (f, type) => {
+			const r = await fetch(base + 'models/whisper/' + f);
+			return type === 'json' ? r.json() : type === 'text' ? r.text() : new Uint8Array(await r.arrayBuffer());
+		};
+		const [vocab, merges, added, enc, dec] = await Promise.all([get('vocab.json', 'json'), get('merges.txt', 'text'), get('added_tokens.json', 'json'), get('encoder.onnx'), get('decoder.onnx')]);
+		whisper = await Whisper.create(ort, { encoder: enc, decoder: dec, tokenizer: new Tokenizer(vocab, merges, added), sessionExtra: { disable_quant_qdq: '1' } });
+		self.postMessage({ type: 'ready' });
+		return whisper;
+	})();
+	loading.catch((e) => {
+		loading = null;
+		self.postMessage({ type: 'error', error: String(e && e.message || e) });
+	});
+	return loading;
+}
+
+// is anybody singing in frames [a, b)? (log-mel energy in the voice range)
+function singing(a, b) {
+	let loud = 0, n = 0;
+	for (let f = a; f < b; ++f) {
+		const fr = ms.frames[f];
+		if (!fr) continue;
+		let mx = -10;
+		for (let m = 8; m < 60; ++m) if (fr[m] > mx) mx = fr[m];
+		if (mx > -4.2) loud++;
+		n++;
+	}
+	return n ? loud / n : 0;
+}
+
+async function run(a, n = WIN) {
+	busy = true;
+	const t0 = performance.now();
+	try {
+		const w = await load();
+		const avail = ms.frames.length;
+		// the encoder takes any length (engines/asr/make_dynamic_encoder.py): pad to 10 s at most
+		const r = await w.transcribe(ms.input(a, WIN), { lang, prompt: mode === 'align' ? prompt : livePrompt(), endFrame: Math.min(n, avail - a) });
+		const w0 = wall0 + a * 10;
+		lastText = r.segments.map((x) => x.text).join(' ').slice(-200);
+		const segs = r.segments
+			.filter((s) => s.logprob > -1.25 && !(r.noSpeech > 0.6 && s.logprob < -0.8))
+			.map((s) => ({ wa: w0 + s.a * 1000, wb: w0 + s.b * 1000, text: s.text, logprob: s.logprob }));
+		self.postMessage({ type: 'segments', segs, lang: r.language, window: { wa: w0, wb: w0 + Math.min(WIN, avail - a) * 10 } });
+	} catch (e) {
+		self.postMessage({ type: 'error', error: String(e && e.message || e) });
+	} finally {
+		lastRunMs = performance.now() - t0;
+		busyMs += lastRunMs;
+		self.postMessage({ type: 'run', ms: Math.round(lastRunMs), mode, intensity, highRuns, frames: n });
+		busy = false;
+		// rest in proportion to the work: the recogniser never takes more than its share of
+		// one core (~25 % while it matters most, much less once the timing is settled)
+		// (rest 8x the work for the usual runs: at most ~11 % of one core, was ~20 %)
+		// (the first few windows after the start or a jump come close together: that is when
+		// the position is found; afterwards the listening rests 8x as long as it worked)
+		const burst = intensity === 'high' && highRuns > 0 && highRuns <= 3;
+		const factor = mode === 'live' ? 1.5 : intensity === 'low' ? 12 : intensity === 'continuous' ? 3 : burst ? 1 : 8;
+		restUntil = performance.now() + lastRunMs * factor;
+		setTimeout(schedule, lastRunMs * factor + 20);
+	}
+}
+
+async function schedule() {
+	if (busy || mode === 'off' || !ms || performance.now() < restUntil) return;
+	const avail = ms.frames.length;
+	if (mode === 'live') {
+		// continue right after the last window (0.5 s overlap); if recognition cannot keep up,
+		// the newest audio wins
+		if (avail - nextAt < LIVE_MIN) return;
+		const a = Math.max(nextAt, avail - WIN);
+		const n = Math.min(WIN, avail - a);
+		nextAt = a + n - 50;
+		if (singing(a, a + n) < 0.12) return schedule();
+		await run(a, n);
+	} else {
+		// align: the latest 10 s, every 6 s while unsure (at most 6 times per song), every 30 s
+		// once sure
+		// 'continuous': lyrics without times are placed by every phrase heard (first play only)
+		const high = (intensity === 'high' && highRuns < 4) || intensity === 'continuous';
+		// after the first burst, covers / live takes keep being checked (sung differently?)
+		const medium = !high && (intensity === 'medium' || intensity === 'high');
+		// (medium every 15 s: back to back windows measured barely better for half more CPU)
+		const every = high ? 600 : medium ? 2500 : 4500;
+		// the first window as soon as 5 s are there (the encoder takes short input)
+		if (avail < 500 || avail - lastRunFrames < every) return;
+		const a = Math.max(0, avail - WIN);
+		if (singing(a, avail) < 0.25) return;
+		lastRunFrames = avail;
+		if (high) highRuns++;
+		await run(a, avail - a);
+	}
+	trim();
+	schedule();
+}
+
+// keep ~40 s of features
+function trim() {
+	const keep = 4000;
+	if (ms.frames.length <= keep + 1000) return;
+	const n = ms.trim(ms.frames.length - keep);
+	wall0 += n * 10;
+	nextAt = Math.max(0, nextAt - n);
+	lastRunFrames -= n;
+}
+
+self.onmessage = (e) => {
+	const m = e.data;
+	if (m.type === 'init') {
+		base = m.base;
+	} else if (m.type === 'config') {
+		const was = mode;
+		mode = m.mode || 'off';
+		intensity = m.intensity || 'low';
+		prompt = m.prompt || '';
+		lang = m.lang || null;
+		if (mode !== 'off' && was === 'off') load();
+		if (mode === 'live' && was !== 'live' && ms) nextAt = Math.max(0, ms.frames.length - WIN);
+		schedule();
+	} else if (m.type === 'audio') {
+		// a gap (pause, seek, new path) starts a new stream
+		if (!ms || Math.abs(m.wall - lastWall) > 400) {
+			// a jump (a seek, a click on a line): the singing there decides where the lyrics are,
+			// so listen closely again for a while
+			if (ms) highRuns = Math.min(highRuns, 1);
+			ms = new MelStream();
+			wall0 = m.wall; // frame 0 = first sample
+			nextAt = 0;
+			lastRunFrames = -1e9;
+		}
+		ms.push(m.pcm);
+		lastWall = m.wall + (m.pcm.length / SR) * 1000;
+		schedule();
+	} else if (m.type === 'reset') {
+		ms = null;
+		highRuns = 0;
+		lastText = '';
+	}
+	const now = performance.now();
+	if (now - statStart > 2000) {
+		self.postMessage({ type: 'stats', load: busyMs / (now - statStart) });
+		busyMs = 0;
+		statStart = now;
+	}
+};
