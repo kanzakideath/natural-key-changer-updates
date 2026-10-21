@@ -1,0 +1,177 @@
+// The text around a YouTube video: its full description and its top comments, read the way
+// the page itself gets them (the watch page's embedded data, and the same "next" request the
+// page sends when the comments come into view). Only used to find lyrics.
+(function (root) {
+	const KCL = (root.KCL = root.KCL || {});
+
+	// a JSON object assigned in the page's HTML: `var name = {...};` / `name = {...};`
+	function embedded(html, name) {
+		const at = html.search(new RegExp(`(?:var\\s+)?${name}\\s*=\\s*\\{`));
+		if (at < 0) return null;
+		const start = html.indexOf('{', at);
+		// walk to the matching brace (strings may contain braces)
+		let depth = 0, inStr = false, esc = false;
+		for (let i = start; i < html.length; ++i) {
+			const c = html[i];
+			if (inStr) {
+				if (esc) esc = false;
+				else if (c === '\\') esc = true;
+				else if (c === '"') inStr = false;
+			} else if (c === '"') inStr = true;
+			else if (c === '{') depth++;
+			else if (c === '}' && --depth === 0) {
+				try {
+					return JSON.parse(html.slice(start, i + 1));
+				} catch (e) {
+					return null;
+				}
+			}
+		}
+		return null;
+	}
+
+	function ytcfg(html) {
+		const out = {};
+		const re = /ytcfg\.set\((\{.*?\})\);/gs;
+		let m;
+		while ((m = re.exec(html))) {
+			try {
+				Object.assign(out, JSON.parse(m[1]));
+			} catch (e) { /* partial */ }
+		}
+		return out;
+	}
+
+	// depth-first search for values under a key
+	function* find(o, key, depth = 0) {
+		if (!o || typeof o !== 'object' || depth > 40) return;
+		if (Array.isArray(o)) {
+			for (const x of o) yield* find(x, key, depth + 1);
+			return;
+		}
+		for (const [k, v] of Object.entries(o)) {
+			if (k === key) yield v;
+			yield* find(v, key, depth + 1);
+		}
+	}
+
+	// the continuation token that loads the comments
+	function commentsToken(initialData) {
+		for (const sec of find(initialData, 'itemSectionRenderer')) {
+			if (sec && sec.sectionIdentifier === 'comment-item-section') {
+				for (const t of find(sec, 'token')) if (typeof t === 'string') return t;
+			}
+		}
+		// newer layouts: the engagement panel for comments
+		for (const p of find(initialData, 'engagementPanelSectionListRenderer')) {
+			if (p && /comment/i.test(p.panelIdentifier || '')) for (const t of find(p, 'token')) if (typeof t === 'string') return t;
+		}
+		return null;
+	}
+
+	const str = (x) => (typeof x === 'string' ? x : (x && (x.content || x.simpleText || (x.runs || []).map((r) => r.text).join(''))) || '');
+	// the "Music" section of the description (songs YouTube matched in the video)
+	function musicOf(data) {
+		for (const v of find(data, 'videoAttributeViewModel')) {
+			const title = str(v && v.title).trim(), artist = str(v && v.subtitle).trim();
+			if (title) return { title, artist: artist.replace(/\s*[•·].*$/, '') };
+		}
+		// older layout: rows labelled SONG / ARTIST
+		for (const sec of find(data, 'videoDescriptionMusicSectionRenderer')) {
+			const row = {};
+			for (const r of find(sec, 'infoRowRenderer')) {
+				const label = runsText(r.title).toLowerCase();
+				const value = runsText(r.defaultMetadata || r.expandedMetadata);
+				if (/song|曲/.test(label) && !row.title) row.title = value;
+				else if (/artist|アーティスト/.test(label) && !row.artist) row.artist = value;
+			}
+			if (row.title) return { title: row.title, artist: row.artist || '' };
+		}
+		return null;
+	}
+
+	function parseWatch(html) {
+		const player = embedded(html, 'ytInitialPlayerResponse');
+		const data = embedded(html, 'ytInitialData');
+		const cfg = ytcfg(html);
+		const vd = player && player.videoDetails;
+		return {
+			videoId: vd && vd.videoId,
+			title: vd && vd.title,
+			author: vd && vd.author,
+			description: (vd && vd.shortDescription) || '',
+			lengthSeconds: vd ? Number(vd.lengthSeconds) || 0 : 0,
+			apiKey: cfg.INNERTUBE_API_KEY || null,
+			context: cfg.INNERTUBE_CONTEXT || null,
+			token: data ? commentsToken(data) : null,
+			music: data ? musicOf(data) : null,
+		};
+	}
+
+	const runsText = (r) => (r && (r.simpleText || (r.runs || []).map((x) => x.text).join(''))) || '';
+	const likeNum = (s) => {
+		const m = /([\d.,]+)\s*([KkMm万千]?)/.exec(String(s || ''));
+		if (!m) return 0;
+		const n = Number(m[1].replace(/,/g, ''));
+		return n * ({ k: 1e3, K: 1e3, m: 1e6, M: 1e6, 万: 1e4, 千: 1e3 }[m[2]] || 1);
+	};
+
+	// comments from a "next" response, in the order shown (top comments)
+	function parseComments(json) {
+		const out = [];
+		// current format: entity payloads
+		for (const p of find(json, 'commentEntityPayload')) {
+			const text = p && p.properties && p.properties.content && p.properties.content.content;
+			if (text) out.push({ text, likes: likeNum(p.toolbar && (p.toolbar.likeCountNotliked || p.toolbar.likeCountA11y)), pinned: false });
+		}
+		// older format
+		for (const c of find(json, 'commentRenderer')) {
+			const text = runsText(c && c.contentText);
+			if (text) out.push({ text, likes: likeNum(runsText(c.voteCount)), pinned: !!c.pinnedCommentBadge });
+		}
+		const seen = new Set();
+		return out.filter((c) => !seen.has(c.text) && seen.add(c.text));
+	}
+
+	// The comments, through the same request the page makes. `post(url, body)` -> JSON.
+	// pages: the first ~20 comments, then more as when scrolling (lyrics are often a little
+	// further down than the very top)
+	async function fetchComments(info, post, pages = 3) {
+		if (!info.token || !info.apiKey || !info.context) return [];
+		const out = [];
+		let token = info.token;
+		for (let p = 0; p < pages && token; ++p) {
+			const json = await post(`/youtubei/v1/next?key=${encodeURIComponent(info.apiKey)}&prettyPrint=false`, { context: info.context, continuation: token });
+			if (!json) break;
+			for (const c of parseComments(json)) if (!out.some((o) => o.text === c.text)) out.push(c);
+			// the "more comments" item at the end of the page
+			let next = null;
+			for (const it of find(json, 'continuationItemRenderer')) for (const t of find(it, 'token')) if (typeof t === 'string') { next = t; break; }
+			token = next && next !== token ? next : null;
+		}
+		return out;
+	}
+
+	// The best lyrics in the text around a video: {kind: 'timed'|'plain', lines|text, from}
+	// accept(text): false for text that cannot be these lyrics (another language than the video)
+	function lyricsAround(description, comments, accept = null) {
+		const T = KCL.textLyrics;
+		const cand = [];
+		const dt = T.timed(description);
+		if (dt) cand.push({ kind: 'timed', lines: dt, from: 'description', score: 1000 + dt.length });
+		const dp = T.plain(description);
+		if (dp) cand.push({ kind: 'plain', text: dp.text, from: 'description', score: 500 + dp.score });
+		(comments || []).slice(0, 80).forEach((c, i) => {
+			const ct = T.timed(c.text);
+			if (ct && ct.length >= 8) cand.push({ kind: 'timed', lines: ct, from: 'comment', score: 900 + ct.length + Math.log10(1 + c.likes) * 5 - i * 0.2 });
+			const cp = T.plain(c.text);
+			// comments must look clearly like lyrics
+			if (cp && cp.lines >= 6) cand.push({ kind: 'plain', text: cp.text, from: 'comment', score: 300 + cp.score + Math.log10(1 + c.likes) * 5 + (c.pinned ? 20 : 0) - i * 0.2 });
+		});
+		cand.sort((a, b) => b.score - a.score);
+		const textOf = (c) => (c.kind === 'timed' ? c.lines.map((l) => l.text).join('\n') : c.text);
+		return (accept ? cand.filter((c) => accept(textOf(c))) : cand)[0] || null;
+	}
+
+	KCL.ytData = { parseWatch, parseComments, fetchComments, lyricsAround, embedded };
+})(globalThis);

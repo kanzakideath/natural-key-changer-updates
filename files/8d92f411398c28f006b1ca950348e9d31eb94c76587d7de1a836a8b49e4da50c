@@ -1,0 +1,4 @@
+// Fingerprint of the big files that updates do not carry (the AI models, the wasm runtime).
+// An update that needs different ones asks for a full re-install instead.
+// Written by tools/update-base.mjs.
+export const BASE_HEAVY = '91afbe86e0c9c08c6aa4831011783ca533db9fade65c704cbd6fb96ec8caf2e6';

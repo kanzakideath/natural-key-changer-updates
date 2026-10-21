@@ -1,0 +1,188 @@
+// Streaming vocal / accompaniment separation with Spleeter (2 stems, vocals model).
+//
+// The model sees magnitude spectrograms (4096-point STFT, hop 1024, lowest 1024 bins) and
+// predicts the vocal magnitude; we turn that into a soft mask, apply it to the complex STFT
+// and resynthesise. Accompaniment = (delayed) input - vocals, so the two stems always add
+// back up to the original exactly.
+//
+// Streaming: every `hop` new frames the model runs on the last `window` frames; it finalises
+// the `hop` frames that are `lookahead` frames older than the newest one.
+// Used by the extension's separation Worker and by the offline test harness.
+import { FFT } from './fft.js';
+
+export const N_FFT = 4096;
+export const HOP = 1024;
+export const MODEL_BINS = 1024;
+// STFT magnitude below which a frame counts as silence (about -80 dBFS for a 4096 Hann window)
+const SILENCE = 0.2;
+
+export class StreamSeparator {
+	// infer: async (Float32Array data [2, 1, frames, 1024]) => Float32Array same shape
+	// window 64 / hop 8 / lookahead 4: 0.32 s algorithmic latency, ~0.1 dB below the best
+	// setting tried (test/sep-sweep.mjs)
+	constructor({ infer, window = 64, hop = 8, lookahead = 4 }) {
+		this.infer = infer;
+		this.W = window;
+		this.H = hop;
+		this.F = lookahead;
+		this.fft = new FFT(N_FFT);
+		this.win = new Float64Array(N_FFT);
+		for (let i = 0; i < N_FFT; ++i) this.win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / N_FFT);
+		// hann analysis * hann synthesis at 75% overlap sums to 1.5
+		this.olaNorm = 1 / 1.5;
+		this.re = new Float64Array(N_FFT);
+		this.im = new Float64Array(N_FFT);
+
+		const histLen = 1 << 20; // input history (~21 s @ 48k), power of two for cheap wrapping
+		this.histMask = histLen - 1;
+		this.hist = [new Float32Array(histLen), new Float32Array(histLen)];
+		this.inCount = 0; // total input samples received
+
+		this.frames = []; // pending frames: {index, mag:[Float32Array(1024) x2], re:[], im:[]}
+		this.magRing = new Map(); // frame index -> mags (kept for the model window)
+		this.nextFrame = 0; // next STFT frame to compute
+		this.nextFinal = 0; // first frame not yet masked
+		const olaLen = (hop + 8) * HOP + N_FFT;
+		this.ola = [new Float64Array(olaLen), new Float64Array(olaLen)];
+		this.olaStart = -(N_FFT - HOP); // absolute sample index of ola[0]
+		this.outPos = 0; // next output sample index
+		this.inferMs = [];
+		this.skipped = 0;
+	}
+
+	// Latency between an input sample arriving and its stems being available (worst case),
+	// excluding inference time.
+	static algorithmicLatency(hop = 8, lookahead = 4) {
+		return (lookahead - 1 + hop) * HOP + N_FFT;
+	}
+
+	frameStart(f) {
+		return f * HOP - (N_FFT - HOP);
+	}
+
+	// Append stereo input; returns array of {start, vocals:[L,R], accomp:[L,R]} chunks.
+	async push(left, right) {
+		const n = left.length;
+		for (let i = 0; i < n; ++i) {
+			const p = (this.inCount + i) & this.histMask;
+			this.hist[0][p] = left[i];
+			this.hist[1][p] = right ? right[i] : left[i];
+		}
+		this.inCount += n;
+		const out = [];
+		while ((this.nextFrame + 1) * HOP <= this.inCount) {
+			this.analyse(this.nextFrame++);
+			const newest = this.nextFrame - 1;
+			if (newest - this.F - this.nextFinal + 1 >= this.H) {
+				out.push(await this.separate(newest));
+			}
+		}
+		return out;
+	}
+
+	analyse(f) {
+		const start = this.frameStart(f);
+		const frame = { index: f, mag: [], re: [], im: [] };
+		for (let c = 0; c < 2; ++c) {
+			const re = this.re, im = this.im;
+			for (let i = 0; i < N_FFT; ++i) {
+				const s = start + i;
+				re[i] = s >= 0 ? this.hist[c][s & this.histMask] * this.win[i] : 0;
+				im[i] = 0;
+			}
+			this.fft.transform(re, im);
+			const half = N_FFT / 2 + 1;
+			const fr = new Float32Array(half), fi = new Float32Array(half), mag = new Float32Array(MODEL_BINS);
+			for (let k = 0; k < half; ++k) {
+				fr[k] = re[k];
+				fi[k] = im[k];
+			}
+			for (let k = 0; k < MODEL_BINS; ++k) mag[k] = Math.hypot(re[k], im[k]);
+			frame.mag.push(mag);
+			frame.re.push(fr);
+			frame.im.push(fi);
+		}
+		this.frames.push(frame);
+		this.magRing.set(f, frame.mag);
+		this.magRing.delete(f - this.W - 1);
+	}
+
+	async separate(newest) {
+		const W = this.W, first = newest - W + 1;
+		const input = new Float32Array(2 * W * MODEL_BINS);
+		let peak = 0;
+		for (let c = 0; c < 2; ++c) {
+			for (let t = 0; t < W; ++t) {
+				const mag = this.magRing.get(first + t);
+				if (mag) input.set(mag[c], (c * W + t) * MODEL_BINS);
+			}
+		}
+		// only the frames being finalised matter for the silence check
+		for (let c = 0; c < 2; ++c) {
+			for (let f = this.nextFinal; f < this.nextFinal + this.H; ++f) {
+				const mag = this.magRing.get(f);
+				if (mag) for (let k = 0; k < MODEL_BINS; ++k) if (mag[c][k] > peak) peak = mag[c][k];
+			}
+		}
+		let pred;
+		if (peak < SILENCE) {
+			// silence (paused video, gaps between songs): nothing to separate, save the CPU
+			pred = new Float32Array(input.length);
+			this.skipped++;
+		} else {
+			const t0 = (globalThis.performance ?? Date).now();
+			pred = await this.infer(input, W);
+			this.inferMs.push((globalThis.performance ?? Date).now() - t0);
+			if (this.inferMs.length > 50) this.inferMs.shift();
+		}
+
+		const g = this.nextFinal + this.H - 1;
+		for (let f = this.nextFinal; f <= g; ++f) {
+			const frame = this.frames.shift();
+			const t = f - first;
+			for (let c = 0; c < 2; ++c) {
+				const re = this.re, im = this.im;
+				re.fill(0);
+				im.fill(0);
+				const off = (c * W + t) * MODEL_BINS;
+				for (let k = 0; k < MODEL_BINS; ++k) {
+					let m = pred[off + k] / (frame.mag[c][k] + 1e-8);
+					m = m < 0 ? 0 : m > 1 ? 1 : m;
+					re[k] = frame.re[c][k] * m;
+					im[k] = frame.im[c][k] * m;
+				}
+				// bins above the model's range stay zero (they go to the accompaniment)
+				for (let k = 1; k < N_FFT / 2; ++k) {
+					re[N_FFT - k] = re[k];
+					im[N_FFT - k] = -im[k];
+				}
+				this.fft.transform(re, im, true);
+				const ola = this.ola[c];
+				const base = this.frameStart(f) - this.olaStart;
+				for (let i = 0; i < N_FFT; ++i) ola[base + i] += re[i] / N_FFT * this.win[i] * this.olaNorm;
+			}
+		}
+		this.nextFinal = g + 1;
+
+		// samples before the first frame that is still unfinished are complete
+		const finalEnd = this.frameStart(this.nextFinal); // unfinished frames start here
+		const len = finalEnd - this.outPos;
+		const chunk = { start: this.outPos, vocals: [new Float32Array(len), new Float32Array(len)], accomp: [new Float32Array(len), new Float32Array(len)] };
+		for (let c = 0; c < 2; ++c) {
+			const ola = this.ola[c];
+			for (let i = 0; i < len; ++i) {
+				const s = this.outPos + i;
+				const v = s >= 0 ? ola[s - this.olaStart] : 0;
+				chunk.vocals[c][i] = v;
+				chunk.accomp[c][i] = this.hist[c][s & this.histMask] - v;
+			}
+			// shift the overlap-add buffer
+			const shift = finalEnd - this.olaStart;
+			ola.copyWithin(0, shift);
+			ola.fill(0, ola.length - shift);
+		}
+		this.olaStart = finalEnd;
+		this.outPos = finalEnd;
+		return chunk;
+	}
+}

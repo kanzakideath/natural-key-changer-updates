@@ -1,0 +1,279 @@
+// Timing for lyrics that come without times (a video's description, a comment, a database
+// entry without timestamps): the recogniser's words are matched to the lines, the most
+// consistent in-order set of matches is kept, and the lines in between are spaced by their
+// length. The result is ordinary timed lyrics, improving as more is heard.
+(function (root) {
+	const KCL = (root.KCL = root.KCL || {});
+
+	// seconds per character when singing (rough; refined from the matches)
+	const rateOf = (text) => (KCL.hasJapanese(text) ? 0.27 : 0.075);
+	const weight = (text) => Math.max(1, KCL.compact(text).length);
+
+	class PlainTimer {
+		constructor(lines) {
+			this.lines = lines.filter((l) => l.text).map((l, i) => ({ text: l.text, i }));
+			this.matches = []; // {m, i, w}
+			this.onsets = []; // media times where singing starts after a pause
+			// snapping to singing onsets measured no better (test/lyrics/plain-eval.mjs): off
+			this.snapMatched = 0;
+			this.snapOther = 0;
+		}
+
+		// singing activity (0.1 s bins from media time m0): lines start where singing starts
+		activity(m0, bins) {
+			const k0 = Math.round(m0 / 0.1);
+			this.act = this.act || new Map();
+			for (let i = 0; i < bins.length; ++i) this.act.set(k0 + i, bins[i]);
+			this.onsetsDirty = true;
+		}
+
+		findOnsets() {
+			if (!this.onsetsDirty) return this.onsets;
+			this.onsetsDirty = false;
+			const keys = [...this.act.keys()].sort((a, b) => a - b);
+			const v = (k) => this.act.get(k) ?? 0;
+			const out = [];
+			for (const k of keys) {
+				let before = 0, after = 0;
+				for (let d = 1; d <= 4; ++d) before += v(k - d);
+				for (let d = 0; d < 3; ++d) after += v(k + d);
+				if (before / 4 < 0.25 && after / 3 >= 0.5 && (!out.length || k * 0.1 - out[out.length - 1] > 0.6)) out.push(k * 0.1);
+			}
+			this.onsets = out;
+			return out;
+		}
+
+		// move a time to the nearest onset within `win` seconds (if any)
+		snap(t, win) {
+			let best = null;
+			for (const o of this.onsets) if (Math.abs(o - t) <= win && (best === null || Math.abs(o - t) < Math.abs(best - t))) best = o;
+			return best === null ? t : best;
+		}
+
+		// recognised segments in media time: [{m, d, text, logprob}]
+		add(segs) {
+			// line index stands in for the time in the matcher
+			const idx = this.lines.map((l, i) => ({ t: i, text: l.text }));
+			const { anchors } = KCL.matchSegments(segs, idx);
+			for (const a of anchors) this.matches.push({ m: a.m, i: a.l, w: a.w * (a.unique ? 1.5 : 1) });
+		}
+
+		// best chain: line index and time both increasing, plausible pace between matches
+		chain() {
+			const A = this.matches.slice().sort((a, b) => a.m - b.m || a.i - b.i);
+			const n = A.length;
+			if (!n) return [];
+			const best = new Float64Array(n), prev = new Int32Array(n).fill(-1);
+			for (let k = 0; k < n; ++k) {
+				best[k] = A[k].w;
+				for (let j = 0; j < k; ++j) {
+					const di = A[k].i - A[j].i, dm = A[k].m - A[j].m;
+					if (di <= 0 || dm <= 0.3) continue;
+					const per = dm / di; // seconds per line
+					if (per < 0.6 || per > 20) continue;
+					if (best[j] + A[k].w > best[k]) {
+						best[k] = best[j] + A[k].w;
+						prev[k] = j;
+					}
+				}
+			}
+			let end = 0;
+			for (let k = 1; k < n; ++k) if (best[k] > best[end]) end = k;
+			const out = [];
+			for (let k = end; k >= 0; k = prev[k]) out.unshift(A[k]);
+			// one match per line (the earliest in the chain)
+			return out.filter((a, j) => j === 0 || a.i !== out[j - 1].i);
+		}
+
+		// timed lines (media time), or null while there is too little to go on
+		lines2() {
+			const c = this.chain();
+			if (c.length < 2) return null;
+			const L = this.lines;
+			// singing rate from the chain (seconds per character)
+			let chars = 0, secs = 0;
+			for (let k = 1; k < c.length; ++k) {
+				for (let i = c[k - 1].i; i < c[k].i; ++i) chars += weight(L[i].text);
+				secs += c[k].m - c[k - 1].m;
+			}
+			const measured = chars > 0 && secs > 0;
+			const rate = measured ? Math.min(0.6, Math.max(0.04, secs / chars)) : rateOf(L[0].text);
+			// the measured rate includes the pauses between lines; the default one does not
+			const gap = measured ? 0 : 0.4;
+			const t = new Array(L.length).fill(null);
+			for (const a of c) t[a.i] = a.m;
+			// between matches: by length
+			for (let k = 1; k < c.length; ++k) {
+				const a = c[k - 1], b = c[k];
+				let total = 0;
+				for (let i = a.i; i < b.i; ++i) total += weight(L[i].text);
+				let acc = 0;
+				for (let i = a.i + 1; i < b.i; ++i) {
+					acc += weight(L[i - 1].text);
+					t[i] = a.m + ((b.m - a.m) * acc) / total;
+				}
+			}
+			// before the first / after the last match: at the measured rate
+			for (let i = c[0].i - 1; i >= 0; --i) t[i] = t[i + 1] - weight(L[i].text) * rate - gap;
+			for (let i = c[c.length - 1].i + 1; i < L.length; ++i) t[i] = t[i - 1] + weight(L[i - 1].text) * rate + gap;
+			// lines start when singing starts: snap to onsets (matched lines less far: the
+			// recogniser's own times are closer)
+			if (this.act) {
+				this.findOnsets();
+				const matched = new Set(c.map((a) => a.i));
+				for (let i = 0; i < L.length; ++i) t[i] = this.snap(t[i], matched.has(i) ? this.snapMatched : this.snapOther);
+				for (let i = 1; i < L.length; ++i) if (t[i] <= t[i - 1]) t[i] = t[i - 1] + 0.3;
+			}
+			return L.map((l, i) => ({ t: Math.max(0, t[i]), text: l.text, estimated: !c.some((a) => a.i === i) }));
+		}
+	}
+
+	// Times guessed from the text alone: lines one after the other at a usual singing pace, a
+	// pause between stanzas (blank lines). A starting point for the tracker, which finds the
+	// real tempo, the intro and the pauses from the singing and the recognised words.
+	PlainTimer.guess = (lines, { start = 12, stanzaGap = 6 } = {}) => {
+		const out = [];
+		let t = start, gapNext = false;
+		for (const l of lines) {
+			if (!l.text) { if (out.length) gapNext = true; continue; }
+			if (gapNext) { t += stanzaGap; gapNext = false; }
+			out.push({ t: +t.toFixed(2), text: l.text });
+			t += weight(l.text) * rateOf(l.text) + 0.5;
+		}
+		return out;
+	};
+
+	const { bigramsOf, fastSim } = KCL;
+
+	// Lyrics without times for a version (a comment's lyrics of a "RAP VERSION", an
+	// arrangement with a verse of its own) on the times of the original's timed lyrics:
+	//   - the lines found in both (in order) take the original's times
+	//   - lines of the version's own between them fill the time of the original lines they
+	//     replace; if they need more (an inserted verse), the rest of the song moves later
+	// -> {lines: [{t, text}], matched: share of the version's lines found in the original}
+	// rap: the version's own lines are rapped (a "RAP VERSION"): ~2.5x faster than sung
+	PlainTimer.skeleton = (plain, timed, { minSim = 0.55, rap = false, ownPace = null } = {}) => {
+		const P = [];
+		let brk = false;
+		for (const l of plain) {
+			if (!l.text) { brk = true; continue; }
+			P.push({ text: l.text, brk });
+			brk = false;
+		}
+		const S = timed.filter((l) => l.text && l.t != null);
+		const n = P.length, m = S.length;
+		if (!n || !m) return { lines: [], matched: 0, shift: 0 };
+		// best in-order pairing (sum of similarities)
+		// (character pairs counted once per line: this runs for many comments, on the page's
+		// own thread — it must stay cheap)
+		const BP = P.map((p) => bigramsOf(p.text)), BS = S.map((l) => bigramsOf(l.text));
+		const sim = (i, j) => { const v = fastSim(BP[i], BS[j]); return v >= minSim ? v : 0; };
+		const D = Array.from({ length: n + 1 }, () => new Float32Array(m + 1));
+		for (let i = 1; i <= n; ++i) for (let j = 1; j <= m; ++j) {
+			const v = sim(i - 1, j - 1);
+			D[i][j] = Math.max(D[i - 1][j], D[i][j - 1], v > 0 ? D[i - 1][j - 1] + v : -1);
+		}
+		const pair = new Array(n).fill(-1);
+		for (let i = n, j = m; i > 0 && j > 0;) {
+			const v = sim(i - 1, j - 1);
+			if (v > 0 && Math.abs(D[i][j] - (D[i - 1][j - 1] + v)) < 1e-6) { pair[i - 1] = j - 1; i--; j--; }
+			else if (D[i - 1][j] >= D[i][j - 1]) i--;
+			else j--;
+		}
+		const matched = pair.filter((j) => j >= 0).length;
+		if (!matched) return { lines: [], matched: 0, shift: 0, ownCount: n };
+		// lines of its own: not found in the original's lyrics at all (a line only written
+		// differently — spacing, punctuation, a latin spelling — is the same line)
+		let ownCount = 0;
+		for (let i = 0; i < n; ++i) {
+			if (pair[i] >= 0) continue;
+			let mx = 0;
+			for (let j = 0; j < m; ++j) mx = Math.max(mx, fastSim(BP[i], BS[j]));
+			if (mx < 0.4) ownCount++;
+		}
+		// how long a line of the version's own takes (the original's own pace)
+		let chars = 0, secs = 0;
+		for (let j = 0; j + 1 < m; ++j) if (S[j + 1].t - S[j].t < 12) { chars += weight(S[j].text); secs += S[j + 1].t - S[j].t; }
+		const rate = chars ? secs / chars : rateOf(S[0].text) + 0.03;
+		// lines of its own much longer than the shared ones are rapped too
+		const avg = (f) => { const x = P.filter((p, i) => f(i)); return x.length ? x.reduce((n, p) => n + weight(p.text), 0) / x.length : 0; };
+		const own = ownPace != null ? ownPace : rap || avg((i) => pair[i] < 0) > 1.5 * avg((i) => pair[i] >= 0) ? 0.4 : 1;
+		const need = (i) => weight(P[i].text) * rate * (pair[i] < 0 ? own : 1) + (P[i].brk ? 1.5 : 0);
+		const t = new Array(n).fill(null);
+		let shift = 0;
+		let prev = -1; // index of the last matched line
+		for (let i = 0; i <= n; ++i) {
+			if (i < n && pair[i] < 0) continue;
+			// lines of its own between prev and i
+			const own = [];
+			for (let k = prev + 1; k < i; ++k) own.push(k);
+			const tb = i < n ? S[pair[i]].t + shift : null;
+			if (prev < 0) {
+				// before the first line found: just before it
+				let x = tb;
+				for (let q = own.length - 1; q >= 0; --q) { x -= need(own[q]); t[own[q]] = x; }
+				if (own.length && x < 0) { shift -= x; for (const k of own) t[k] -= x; }
+				if (i < n) t[i] = S[pair[i]].t + shift;
+			} else {
+				const ta = t[prev];
+				// the room: from the end of the last line found to the next one found
+				const slot = tb === null ? Infinity : tb - ta;
+				const used = Math.min(need(prev), slot * 0.7); // the line found takes its part
+				const room = slot - used;
+				const want = own.reduce((s2, k) => s2 + need(k), 0);
+				let x = ta + used;
+				const scale = own.length && want <= room && isFinite(room) ? room / want : 1;
+				for (const k of own) { t[k] = x; x += need(k) * Math.min(scale, 1.6); }
+				if (tb !== null) {
+					// an inserted verse: what follows comes later by what did not fit
+					if (own.length && want > room) shift += want - room;
+					t[i] = S[pair[i]].t + shift;
+				}
+			}
+			prev = i;
+		}
+		const lines = P.map((p, i) => ({ t: +Math.max(0, t[i]).toFixed(2), text: p.text }));
+		for (let i = 1; i < lines.length; ++i) if (lines[i].t <= lines[i - 1].t) lines[i].t = +(lines[i - 1].t + 0.3).toFixed(2);
+		return { lines, matched: matched / n, shift, ownCount };
+	};
+
+	// A part of its own (a rap verse written in a comment) put into the original's timed
+	// lyrics, where the original has an instrumental stretch about as long as the part takes
+	// (a cover where a rapper fills the interlude). -> {lines, gap: {from, to}} or null
+	PlainTimer.fillGap = (part, timed, { minGap = 6 } = {}) => {
+		const P = part.filter((l) => l.text);
+		const S = timed.filter((l) => l.text && l.t != null);
+		if (P.length < 3 || S.length < 4) return null;
+		let chars = 0, secs = 0;
+		for (let j = 0; j + 1 < S.length; ++j) if (S[j + 1].t - S[j].t < 12) { chars += weight(S[j].text); secs += S[j + 1].t - S[j].t; }
+		const rate = chars ? secs / chars : rateOf(S[0].text);
+		// rapped: ~0.45x the sung pace
+		const need = P.reduce((n, l) => n + weight(l.text), 0) * rate * 0.45;
+		const songEnd = S[S.length - 1].t;
+		let best = null;
+		for (let j = 0; j + 1 < S.length; ++j) {
+			const from = S[j].t + Math.min(KCL.singDuration ? KCL.singDuration(S[j].text) * 1.1 : 3, (S[j + 1].t - S[j].t) * 0.6);
+			const to = S[j + 1].t - 0.3;
+			const len = to - from;
+			if (len < minGap) continue;
+			// the closer to the length it needs, the better (a part longer than every gap: the
+			// version inserted it — then the longest one); the middle of the song over its ends
+			const mid = (from + to) / 2 / songEnd;
+			const score = -Math.abs(Math.log(Math.min(len, need * 2) / need)) - (mid < 0.15 || mid > 0.9 ? 0.7 : 0) + (mid > 0.25 && mid < 0.75 ? 0.15 : 0);
+			if (!best || score > best.score) best = { j, from, to, len, score };
+		}
+		if (!best) return null;
+		// the part, at its pace, from the start of the gap (spread a little if the gap is longer);
+		// what does not fit moves the rest of the song later
+		const span = Math.min(Math.max(best.len - 0.3, need), need * 1.25);
+		const shift = Math.max(0, span + 0.6 - best.len);
+		const total = P.reduce((n, l) => n + weight(l.text), 0);
+		const x = best.from + 0.3;
+		let acc = 0;
+		const ins = P.map((l) => { const t = x + (span * acc) / total; acc += weight(l.text); return { t: +t.toFixed(2), text: l.text, own: true }; });
+		const lines = [...S.slice(0, best.j + 1).map((l) => ({ t: l.t, text: l.text })), ...ins, ...S.slice(best.j + 1).map((l) => ({ t: +(l.t + shift).toFixed(2), text: l.text }))];
+		return { lines, gap: { from: best.from, to: best.to }, shift };
+	};
+
+	KCL.PlainTimer = PlainTimer;
+})(globalThis);

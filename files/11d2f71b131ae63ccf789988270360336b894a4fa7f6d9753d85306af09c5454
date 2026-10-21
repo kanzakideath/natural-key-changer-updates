@@ -1,0 +1,52 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title data-i18n="appShort">Key Changer</title>
+<link rel="stylesheet" href="../range/range.css">
+<link rel="stylesheet" href="welcome.css">
+</head>
+<body>
+<main>
+	<header class="hero">
+		<img src="../icons/icon128.png" alt="" width="88" height="88">
+		<h1 data-i18n="welcomeTitle"></h1>
+		<p class="lead" data-i18n="welcomeLead"></p>
+	</header>
+
+	<ol class="steps-cards">
+		<li class="card step">
+			<span class="num">1</span>
+			<div><h2 data-i18n="welcomeStep1Title"></h2><p data-i18n="welcomeStep1"></p></div>
+			<svg class="step-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 17v5" /><path d="M9 10.76V6h6v4.76l2 3.24H7z" /><path d="M8 2h8" /></svg>
+		</li>
+		<li class="card step">
+			<span class="num">2</span>
+			<div><h2 data-i18n="welcomeStep2Title"></h2><p data-i18n="welcomeStep2"></p></div>
+			<svg class="step-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4v16l13-8z" /></svg>
+		</li>
+		<li class="card step">
+			<span class="num">3</span>
+			<div><h2 data-i18n="welcomeStep3Title"></h2><p data-i18n="welcomeStep3"></p></div>
+			<svg class="step-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 15l5 5 5-5" /><path d="M7 9l5-5 5 5" /></svg>
+		</li>
+	</ol>
+
+	<section class="card practice">
+		<h2 data-i18n="welcomePracticeTitle"></h2>
+		<p data-i18n="welcomePractice"></p>
+		<div class="actions">
+			<a class="btn primary" href="../range/range.html" data-i18n="welcomeRange"></a>
+			<a class="btn" href="https://www.youtube.com/" target="_blank" rel="noopener" data-i18n="welcomeTry"></a>
+		</div>
+	</section>
+
+	<p class="privacy">
+		<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2" /><path d="M8 11V7a4 4 0 0 1 8 0v4" /></svg>
+		<span data-i18n="welcomePrivacy"></span>
+	</p>
+</main>
+<script type="module" src="welcome.js"></script>
+</body>
+</html>

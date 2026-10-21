@@ -1,0 +1,62 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title data-i18n="rangePageTitle">Your vocal range</title>
+<link rel="stylesheet" href="range.css">
+</head>
+<body>
+<main>
+	<header>
+		<img src="../icons/icon48.png" alt="" width="40" height="40">
+		<div>
+			<h1 data-i18n="rangePageTitle"></h1>
+			<p class="lead" data-i18n="rangeLead"></p>
+		</div>
+	</header>
+
+	<section class="card live">
+		<div class="live-note">
+			<div class="note-big" id="noteBig">–</div>
+			<div class="note-sub" id="noteSub" data-i18n="rangeLiveHint"></div>
+		</div>
+		<div class="ruler-wrap">
+			<div class="ruler" id="ruler" aria-hidden="true">
+				<div class="ruler-range" id="rulerRange"></div>
+				<div class="ruler-marker" id="rulerMarker"></div>
+			</div>
+			<div class="ruler-labels" id="rulerLabels"></div>
+		</div>
+		<div class="actions">
+			<button id="mic" class="btn primary" type="button">
+				<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3" /><path d="M5 11a7 7 0 0 0 14 0" /><path d="M12 18v3" /></svg>
+				<span id="micLabel" data-i18n="micStart"></span>
+			</button>
+			<button id="reset" class="btn" type="button" data-i18n="reset"></button>
+		</div>
+		<ol class="steps">
+			<li data-i18n="step1"></li>
+			<li data-i18n="step2"></li>
+			<li data-i18n="step3"></li>
+			<li data-i18n="step4"></li>
+		</ol>
+		<p class="note" data-i18n="rangeNote"></p>
+	</section>
+
+	<section class="card">
+		<h2 data-i18n="registerTitle"></h2>
+		<div class="pick-row">
+			<label><span data-i18n="lowNote"></span><select id="low"></select></label>
+			<span class="dash">–</span>
+			<label><span data-i18n="highNote"></span><select id="high"></select></label>
+		</div>
+		<div class="save-row">
+			<span id="saved" class="saved" role="status"></span>
+			<button id="save" class="btn primary" type="button" data-i18n="save"></button>
+		</div>
+	</section>
+</main>
+<script type="module" src="range.js"></script>
+</body>
+</html>

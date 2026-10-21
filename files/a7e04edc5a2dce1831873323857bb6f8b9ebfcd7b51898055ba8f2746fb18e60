@@ -1,0 +1,290 @@
+// Worker that runs the vocal/accompaniment separation model (Spleeter 2-stems, vocals)
+// with ONNX Runtime Web: WebGPU on a real GPU when it is faster, otherwise WASM (single
+// thread: cross-origin isolation, needed for threads, would break tab capture).
+// Audio arrives from the AudioWorklet over a MessagePort and the stems go straight back.
+import * as ort from '../ort/ort.webgpu.min.mjs';
+import { StreamSeparator, MODEL_BINS } from '../lib/separator.js';
+import { MelodyTracker } from '../lib/notes.js';
+
+let session = null;
+let separator = null;
+let port = null;
+let queue = Promise.resolve();
+let backend = '';
+let busyMs = 0;
+let statStart = performance.now();
+let melody = null; // pitch statistics of the separated vocals (for the range display)
+let sampleRate = 48000;
+let sepConfig = null;
+let generation = 0; // bumps for every new processing path
+let analysisOnly = false; // separator used only for the lyrics (light mode): no stems back
+
+// --- singing activity for the lyrics timing: voiced fraction per 0.1 s of the vocals ---
+const VAD_BIN = 0.1;
+let vad = null; // {start (sample of bin 0), bins: [], cur: {v, n}, curBin, frame}
+let asrOn = false; // also send the vocals (16 kHz mono) for speech recognition
+let asrState = null; // resampler state
+
+function resetVad() {
+	vad = null;
+	asrState = null;
+}
+
+function vadFrame(voiced) {
+	if (!vad) return;
+	// centre of this frame, in input samples
+	const t = melody;
+	const center = vad.origin + (vad.frame++ * t.H + t.N / 2) * t.step;
+	const bin = Math.floor((center - vad.origin) / (VAD_BIN * sampleRate));
+	if (vad.curBin === null) vad.curBin = bin;
+	while (bin > vad.curBin) {
+		vad.bins.push(vad.n ? vad.v / vad.n : 0);
+		vad.v = vad.n = 0;
+		vad.curBin++;
+	}
+	vad.v += voiced ? 1 : 0;
+	vad.n++;
+}
+
+function flushVad(gen) {
+	if (!vad || vad.bins.length < 10) return;
+	const first = vad.curBin - vad.bins.length;
+	self.postMessage({ type: 'vad', gen, start: vad.origin + first * VAD_BIN * sampleRate, binSamples: VAD_BIN * sampleRate, bins: vad.bins });
+	vad.bins = [];
+}
+
+// 48 kHz -> 16 kHz (mono): 3-tap average after a short low-pass, enough for speech recognition
+function to16k(x) {
+	const ratio = sampleRate / 16000;
+	if (!asrState) asrState = { prev: 0, acc: 0, phase: 0 };
+	const out = new Float32Array(Math.floor((x.length + asrState.phase) / ratio) + 1);
+	let n = 0;
+	let { prev, phase } = asrState;
+	for (let i = 0; i < x.length; ++i) {
+		const y = 0.5 * x[i] + 0.5 * prev; // gentle low-pass
+		prev = x[i];
+		asrState.acc += y;
+		if (++phase >= ratio) {
+			out[n++] = asrState.acc / ratio;
+			asrState.acc = 0;
+			phase -= ratio;
+		}
+	}
+	asrState.prev = prev;
+	asrState.phase = phase;
+	return out.subarray(0, n);
+}
+
+// f16: the half-precision model (GPUs with shader-f16): same separation quality (SDR 9.01 dB
+// both, test/sep-sweep.mjs), half the memory traffic, so less GPU work and heat
+async function createSession(base, provider, threads, f16 = false) {
+	ort.env.wasm.wasmPaths = base + 'ort/';
+	ort.env.wasm.numThreads = threads;
+	ort.env.logLevel = 'error';
+	return ort.InferenceSession.create(base + (f16 ? 'models/spleeter-vocals-f16.onnx' : 'models/spleeter-vocals.onnx'), {
+		executionProviders: [provider],
+		graphOptimizationLevel: 'all',
+	});
+}
+
+async function timeRun(s, frames) {
+	const x = new ort.Tensor('float32', new Float32Array(2 * frames * MODEL_BINS), [2, 1, frames, MODEL_BINS]);
+	const t0 = performance.now();
+	await s.run({ x });
+	return performance.now() - t0;
+}
+
+let gpuHasF16 = false;
+// both models on the same (music-like) input: masks must agree within 1%
+async function sameResult(a, b, frames) {
+	const n = 2 * frames * MODEL_BINS;
+	const data = new Float32Array(n);
+	let seed = 1;
+	for (let i = 0; i < n; ++i) {
+		seed = (seed * 16807) % 2147483647;
+		const bin = i % MODEL_BINS;
+		data[i] = ((seed / 2147483647) * 40) / (1 + bin / 30); // louder low bins, like music
+	}
+	const x = new ort.Tensor('float32', data, [2, 1, frames, MODEL_BINS]);
+	const ya = (await a.run({ x })).y.data, yb = (await b.run({ x })).y.data;
+	let num = 0, den = 0;
+	for (let i = 0; i < ya.length; ++i) {
+		if (!Number.isFinite(yb[i])) return false;
+		num += (ya[i] - yb[i]) ** 2;
+		den += ya[i] ** 2;
+	}
+	return num / (den || 1) < 1e-4;
+}
+
+async function hasRealGpu() {
+	if (!self.navigator.gpu) return false;
+	try {
+		const a = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+		if (!a) return false;
+		gpuHasF16 = a.features.has('shader-f16');
+		const info = a.info || {};
+		const desc = `${info.vendor || ''} ${info.architecture || ''} ${info.description || ''}`.toLowerCase();
+		// software rasterisers are far slower than the WASM path
+		return !(info.isFallbackAdapter || /swiftshader|llvmpipe|software|microsoft basic/.test(desc));
+	} catch (e) {
+		return false;
+	}
+}
+
+async function init({ base, window, hop, profile }) {
+	const threads = 1;
+	// a previous measurement on this computer: load that backend directly, check it once
+	if (profile && profile.backend) {
+		try {
+			const s = await createSession(base, profile.backend === 'WebGPU' ? 'webgpu' : 'wasm', threads, !!profile.f16);
+			await timeRun(s, window);
+			const ms = await timeRun(s, window);
+			session = s;
+			backend = profile.backend;
+			return { backend, f16: !!profile.f16, inferMs: Math.max(ms, profile.inferMs * 0.8), worstMs: Math.max(ms, profile.worstMs || profile.inferMs), cached: true };
+		} catch (e) { /* fall through to a full measurement */ }
+	}
+	const candidates = [];
+	if (await hasRealGpu()) candidates.push('webgpu');
+	candidates.push('wasm');
+	let lastError = null;
+	let worstMs = 0;
+	for (const provider of candidates) {
+		try {
+			const s = await createSession(base, provider, threads);
+			await timeRun(s, window); // warm-up (shader compilation etc.)
+			// slowest of three runs: the margin must cover a busy computer, not the average case
+			const ms = Math.max(await timeRun(s, window), await timeRun(s, window), await timeRun(s, window));
+			const hopMs = hop * 1024 / sampleRate * 1000;
+			if (provider === 'webgpu' && ms > hopMs * 0.4 && candidates.includes('wasm')) {
+				// slow GPU (or software rendering): try the CPU path too and keep the faster one
+				const w = await createSession(base, 'wasm', threads);
+				await timeRun(w, window);
+				const wms = await timeRun(w, window);
+				if (wms < ms) {
+					session = w;
+					backend = 'WASM';
+					return { backend, inferMs: wms };
+				}
+			}
+			session = s;
+			backend = provider === 'webgpu' ? 'WebGPU' : 'WASM';
+			let f16 = false;
+			if (provider === 'webgpu' && gpuHasF16) {
+				// the half-precision model, if this GPU computes it as accurately
+				try {
+					const h = await createSession(base, 'webgpu', threads, true);
+					if (await sameResult(s, h, window)) {
+						await timeRun(h, window);
+						const hms = Math.max(await timeRun(h, window), await timeRun(h, window));
+						if (hms <= ms * 1.1) {
+							session = h;
+							f16 = true;
+						}
+					}
+				} catch (e) { /* keep fp32 */ }
+			}
+			return { backend, f16, inferMs: ms };
+		} catch (e) {
+			lastError = e;
+		}
+	}
+	throw lastError || new Error('could not load the separation model');
+}
+
+function makeSeparator(opts) {
+	separator = new StreamSeparator({
+		...opts,
+		infer: async (data, frames) => {
+			const out = await session.run({ x: new ort.Tensor('float32', data, [2, 1, frames, MODEL_BINS]) });
+			return out.y.data;
+		},
+	});
+}
+
+let streamBase = null; // path sample index of the first sample given to the separator
+
+async function handleAudio(msg, gen) {
+	if (gen !== generation) return; // queued audio of a path that has been replaced
+	const t0 = performance.now();
+	// the separator counts from 0; a tap may start later in its path's timeline
+	if (streamBase === null) streamBase = msg.start || 0;
+	const chunks = await separator.push(msg.l, msg.r);
+	for (const c of chunks) {
+		if (melody) {
+			const v = c.vocals[0].map((x, i) => (x + c.vocals[1][i]) * 0.5);
+			if (!vad) vad = { origin: streamBase + c.start, frame: 0, bins: [], v: 0, n: 0, curBin: null };
+			melody.onFrame = vadFrame;
+			melody.push(v);
+			if (asrOn) {
+				const pcm = to16k(v);
+				self.postMessage({ type: 'asr-audio', gen, start: streamBase + c.start, pcm }, [pcm.buffer]);
+			}
+		}
+		if (!analysisOnly) {
+			port.postMessage({ type: 'stems', start: c.start, vocals: c.vocals, accomp: c.accomp },
+				[c.vocals[0].buffer, c.vocals[1].buffer, c.accomp[0].buffer, c.accomp[1].buffer]);
+		}
+	}
+	if (vad && vad.bins.length >= 10) flushVad(gen);
+	busyMs += performance.now() - t0;
+	const now = performance.now();
+	if (now - statStart > 1000) {
+		const ms = separator.inferMs;
+		self.postMessage({
+			type: 'stats',
+			load: busyMs / (now - statStart),
+			inferMs: ms.length ? ms.reduce((a, b) => a + b, 0) / ms.length : 0,
+			backend,
+			melody: melody ? { bins: Array.from(melody.hist.bins), seconds: melody.hist.seconds } : null,
+		});
+		busyMs = 0;
+		statStart = now;
+	}
+}
+
+self.onmessage = async (e) => {
+	const msg = e.data;
+	if (msg.type === 'init') {
+		sampleRate = msg.sampleRate || 48000;
+		melody = new MelodyTracker(sampleRate);
+		try {
+			const info = await init(msg);
+			sepConfig = { window: msg.window, lookahead: msg.lookahead };
+			analysisOnly = !!msg.analysisOnly;
+			// Pick how often to run the model from its measured speed on this computer:
+			// every 8 frames (lowest latency) when that takes under ~55 % of one core, otherwise
+			// every 16 frames (+0.17 s latency, half the CPU, same quality).
+			const frameMs = 1024 / sampleRate * 1000;
+			let hop = msg.hop;
+			if (!analysisOnly && info.inferMs > 0.55 * hop * frameMs) hop = msg.hop * 2;
+			if (info.inferMs > 0.6 * hop * frameMs) throw new Error('too slow for real-time separation');
+			sepConfig.hop = hop;
+			self.postMessage({ type: 'ready', ...info, hop });
+		} catch (err) {
+			self.postMessage({ type: 'error', error: String(err && err.message || err) });
+		}
+	} else if (msg.type === 'reset-melody') {
+		melody = new MelodyTracker(sampleRate);
+		resetVad();
+	} else if (msg.type === 'asr') {
+		asrOn = !!msg.on;
+	} else if (msg.type === 'port') {
+		// a new processing path: start separating from its sample 0
+		if (port) port.onmessage = null;
+		makeSeparator(sepConfig);
+		const gen = ++generation;
+		streamBase = null;
+		// a new path counts its samples from 0 again (the range statistics carry over)
+		const hist = melody && melody.hist;
+		melody = new MelodyTracker(sampleRate);
+		if (hist) melody.hist = hist;
+		resetVad();
+		port = msg.port;
+		port.onmessage = (ev) => {
+			if (ev.data.type === 'audio') queue = queue.then(() => handleAudio(ev.data, gen)).catch((err) => {
+				self.postMessage({ type: 'error', error: String(err && err.message || err) });
+			});
+		};
+	}
+};

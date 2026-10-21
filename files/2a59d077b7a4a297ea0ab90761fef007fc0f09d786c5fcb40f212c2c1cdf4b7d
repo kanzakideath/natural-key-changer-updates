@@ -1,0 +1,126 @@
+// Lyrics timeline: maps the time of the video to the time of the lyrics and finds the line
+// being sung. The map is piecewise linear between anchors (media time -> lyrics time) and
+// continues with slope 1 outside them, so a plain offset is just one anchor.
+(function (root) {
+	const KCL = (root.KCL = root.KCL || {});
+
+	// opts.jumps: the lyrics may go back (a version that repeats a part, or starts with the
+	// last chorus); opts.rate: lyrics seconds per media second outside the anchors (tempo)
+	class TimeMap {
+		constructor(anchors = [], opts = {}) {
+			this.jumps = !!opts.jumps;
+			this.r = opts.rate || 1;
+			this.set(anchors);
+		}
+		set(anchors) {
+			// keep monotonic in media time (and in lyrics time unless jumps are allowed)
+			const a = anchors.slice().sort((x, y) => x.m - y.m);
+			this.a = [];
+			for (const p of a) {
+				const last = this.a[this.a.length - 1];
+				if (last && (p.m - last.m < 0.04 || (!this.jumps && p.l < last.l))) continue; // flat (lyrics hold) is allowed
+				this.a.push({ m: p.m, l: p.l });
+			}
+		}
+		get offset() {
+			// lyrics time - media time at the first anchor (0 if none)
+			return this.a.length ? this.a[0].l - this.a[0].m : 0;
+		}
+		static shift(seconds) {
+			return new TimeMap([{ m: 0, l: seconds }]);
+		}
+		// media -> lyrics
+		toLyrics(m) {
+			const a = this.a;
+			if (!a.length) return m;
+			if (m <= a[0].m) return a[0].l + (m - a[0].m) * this.r;
+			const last = a[a.length - 1];
+			if (m >= last.m) return last.l + (m - last.m) * this.r;
+			let lo = 0, hi = a.length - 1;
+			while (hi - lo > 1) {
+				const mid = (lo + hi) >> 1;
+				if (a[mid].m <= m) lo = mid;
+				else hi = mid;
+			}
+			const p = a[lo], q = a[hi];
+			return p.l + ((m - p.m) * (q.l - p.l)) / (q.m - p.m);
+		}
+		// lyrics -> media (where the lyrics go back, the first place after `near` that shows l)
+		// flat: beyond what has been observed, assume the same speed as the recording's (a wrong
+		// tempo estimate would grow with the distance)
+		toMedia(l, near = -Infinity, flat = false) {
+			const a = this.a;
+			if (!a.length) return l;
+			if (this.jumps) {
+				// every media time that shows l: the first one from `near` on, else the last one
+				let after = null, before = null;
+				for (let i = 0; i + 1 < a.length; ++i) {
+					const p = a[i], q = a[i + 1];
+					if (q.l < p.l || l < p.l || l > q.l) continue;
+					const m = q.l === p.l ? p.m : p.m + ((l - p.l) * (q.m - p.m)) / (q.l - p.l);
+					if (m >= near) { if (after === null || m < after) after = m; }
+					else if (before === null || m > before) before = m;
+				}
+				if (after !== null || before !== null) return after !== null ? after : before;
+				if (l <= a[0].l) return a[0].m + (l - a[0].l) / (flat ? 1 : this.r);
+				const lastA = a[a.length - 1];
+				return lastA.m + (l - lastA.l) / (flat ? 1 : this.r);
+			}
+			if (l <= a[0].l) return a[0].m + (l - a[0].l) / this.r;
+			const last = a[a.length - 1];
+			if (l >= last.l) return last.m + (l - last.l) / this.r;
+			let lo = 0, hi = a.length - 1;
+			while (hi - lo > 1) {
+				const mid = (lo + hi) >> 1;
+				if (a[mid].l <= l) lo = mid;
+				else hi = mid;
+			}
+			const p = a[lo], q = a[hi];
+			if (q.l === p.l) return p.m; // lyrics holding: the hold starts there
+			return p.m + ((l - p.l) * (q.m - p.m)) / (q.l - p.l);
+		}
+		// local speed (lyrics seconds per media second) around a media time
+		rate(m) {
+			return (this.toLyrics(m + 0.5) - this.toLyrics(m - 0.5));
+		}
+		toJSON() {
+			return this.jumps || this.r !== 1 ? { a: this.a, jumps: this.jumps, rate: this.r } : this.a;
+		}
+		static from(json) {
+			if (json && !Array.isArray(json) && json.a) return new TimeMap(json.a, { jumps: json.jumps, rate: json.rate });
+			return new TimeMap(Array.isArray(json) ? json : []);
+		}
+	}
+
+	// index of the line sung at lyrics time t (-1 before the first line)
+	function lineAt(lines, t) {
+		let lo = 0, hi = lines.length - 1, ans = -1;
+		while (lo <= hi) {
+			const mid = (lo + hi) >> 1;
+			if (lines[mid].t <= t) {
+				ans = mid;
+				lo = mid + 1;
+			} else hi = mid - 1;
+		}
+		return ans;
+	}
+
+	// An "interlude" is a long stretch without singing (intro, solos): shown as animated dots.
+	const INTERLUDE = 5; // seconds
+	function interludeAt(lines, t) {
+		const i = lineAt(lines, t);
+		const next = lines[i + 1];
+		if (i < 0) {
+			const first = lines.find((l) => l.text);
+			return first && first.t >= INTERLUDE && t < first.t ? { from: 0, to: first.t, before: lines.indexOf(first) } : null;
+		}
+		const cur = lines[i];
+		// an empty marker line, or a line that lasts very long (its singing ended long ago)
+		if (!cur.text && next && next.t - cur.t >= INTERLUDE * 0.6) return { from: cur.t, to: next.t, before: i + 1 };
+		return null;
+	}
+
+	KCL.TimeMap = TimeMap;
+	KCL.lineAt = lineAt;
+	KCL.interludeAt = interludeAt;
+})(globalThis);

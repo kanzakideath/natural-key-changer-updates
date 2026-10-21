@@ -1,0 +1,110 @@
+// Thin wrapper around the standalone pitch-shift WASM modules (engines/wrapper/engine.cpp).
+// Used both inside the AudioWorklet and by the offline test harness (test/render.mjs),
+// so the code path that is measured is the same one that is heard.
+
+export const ENGINES = {
+	// id: [wasm file, variant, label]
+	'signalsmith': ['signalsmith.wasm', 0, 'Signalsmith Stretch'],
+	'signalsmith-cheap': ['signalsmith.wasm', 1, 'Signalsmith Stretch (cheaper preset)'],
+	'signalsmith-80': ['signalsmith.wasm', 2, 'Signalsmith Stretch (80ms)'],
+	'signalsmith-60': ['signalsmith.wasm', 3, 'Signalsmith Stretch (60ms)'],
+	'rubberband-r3': ['rubberband.wasm', 0, 'Rubber Band R3'],
+	'rubberband-r3-short': ['rubberband.wasm', 1, 'Rubber Band R3 (short window)'],
+	'rubberband-live': ['rubberband.wasm', 2, 'Rubber Band LiveShifter'],
+};
+
+function wasiStubs(getMemory) {
+	const view = () => new DataView(getMemory().buffer);
+	return {
+		random_get(ptr, len) {
+			const bytes = new Uint8Array(getMemory().buffer, ptr, len);
+			for (let i = 0; i < len; ++i) bytes[i] = (Math.random() * 256) | 0;
+			return 0;
+		},
+		clock_time_get(id, precision, outPtr) {
+			view().setBigUint64(outPtr, BigInt(Date.now()) * 1000000n, true);
+			return 0;
+		},
+		fd_write(fd, iovs, iovsLen, nwrittenPtr) {
+			const v = view();
+			let total = 0;
+			for (let i = 0; i < iovsLen; ++i) total += v.getUint32(iovs + i * 8 + 4, true);
+			v.setUint32(nwrittenPtr, total, true);
+			return 0;
+		},
+		fd_read() { return 0; },
+		fd_close() { return 0; },
+		fd_seek() { return 0; },
+		environ_sizes_get(countPtr, sizePtr) {
+			view().setUint32(countPtr, 0, true);
+			view().setUint32(sizePtr, 0, true);
+			return 0;
+		},
+		environ_get() { return 0; },
+		proc_exit() {},
+	};
+}
+
+export class WasmEngine {
+	// module: compiled WebAssembly.Module
+	constructor(module, variant, sampleRate, channels) {
+		let memory = null;
+		const instance = new WebAssembly.Instance(module, {
+			env: { emscripten_notify_memory_growth() {} },
+			wasi_snapshot_preview1: wasiStubs(() => memory),
+		});
+		this.exports = instance.exports;
+		memory = this.exports.memory;
+		if (this.exports._initialize) this.exports._initialize();
+		this.channels = channels;
+		this.handle = this.exports.eng_create(variant, sampleRate, channels);
+		this.maxBlock = this.exports.eng_max_block();
+		this.params = { semitones: 0, formantSemitones: 0, preserve: true, formantBaseHz: 0 };
+		this.apply();
+	}
+
+	io(kind, c, n) {
+		const ptr = kind === 'in' ? this.exports.eng_input(this.handle, c) : this.exports.eng_output(this.handle, c);
+		return new Float32Array(this.exports.memory.buffer, ptr, n);
+	}
+
+	set(params) {
+		Object.assign(this.params, params);
+		this.apply();
+	}
+
+	apply() {
+		const p = this.params;
+		this.exports.eng_set(this.handle, p.semitones, p.formantSemitones, p.preserve ? 1 : 0, p.formantBaseHz);
+	}
+
+	get latency() {
+		return this.exports.eng_latency(this.handle);
+	}
+
+	get underruns() {
+		return this.exports.eng_underruns(this.handle);
+	}
+
+	// inputs/outputs: arrays of Float32Array (one per channel), length n <= maxBlock.
+	// A mono input is copied to every engine channel.
+	process(inputs, outputs, n) {
+		for (let c = 0; c < this.channels; ++c) {
+			const src = inputs[c] || inputs[0];
+			const dst = this.io('in', c, n);
+			if (src) dst.set(src.subarray(0, n)); else dst.fill(0);
+		}
+		this.exports.eng_process(this.handle, n);
+		for (let c = 0; c < outputs.length; ++c) {
+			outputs[c].set(this.io('out', Math.min(c, this.channels - 1), n));
+		}
+	}
+
+	reset() {
+		this.exports.eng_reset(this.handle);
+	}
+
+	destroy() {
+		this.exports.eng_destroy(this.handle);
+	}
+}

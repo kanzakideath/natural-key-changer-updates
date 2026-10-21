@@ -1,0 +1,286 @@
+// Delays what you see by the same amount the processed audio is delayed, so lips and sound
+// stay together. Frames of the playing <video> are copied (downscaled) into a queue and drawn
+// on a canvas laid over the video after `delay` seconds; the real video is made transparent
+// but keeps playing (and keeps its controls).
+(() => {
+	if (window.__keyChangerVideoDelay) return;
+	window.__keyChangerVideoDelay = true;
+
+	// Kept deliberately cheap (this runs for every video frame):
+	//  - frames are not copied: each decoded frame is held as a WebCodecs VideoFrame (a reference
+	//    to the decoder's picture) until it is due, then drawn once, at the size it is shown at.
+	//    If holding frames ever stalls a decoder, it falls back to copying them (ImageBitmap);
+	//  - letterboxing is done by CSS object-fit, like the video itself;
+	//  - nothing runs per display refresh: due frames are shown from the same video-frame
+	//    callback, so a paused or hidden video costs nothing;
+	//  - the layout is read only when the video box changes (ResizeObserver).
+	let delay = 0; // seconds
+	let video = null;
+	let canvas = null;
+	let ctx = null;
+	let frames = []; // {t, img: VideoFrame | ImageBitmap}
+	let copyMode = false; // true after a decoder stalled while frames were held
+	let stalls = 0;
+	let lastSeek = 0;
+	let running = false;
+	let failed = false;
+	let savedOpacity = '';
+	let target = { w: 2, h: 2 }; // size frames are drawn at
+	let laidOutFor = ''; // video resolution the size was computed for
+	let resizeObs = null;
+	let pickTimer = 0;
+	let rvfcId = 0;
+	let hidden = false;
+	let lastShown = 0;
+	let lastCb = 0;
+	let interval = 33; // ms between video frames (running estimate)
+	let drainTimer = 0;
+
+	function pickVideo() {
+		let best = null, bestArea = 0;
+		for (const v of document.querySelectorAll('video')) {
+			const r = v.getBoundingClientRect();
+			const area = r.width * r.height;
+			const visible = r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth;
+			if (!visible || area < 160 * 90) continue;
+			const score = area * (v.paused ? 0.5 : 1);
+			if (score > bestArea) { best = v; bestArea = score; }
+		}
+		return best;
+	}
+
+	function clearFrames() {
+		for (const f of frames) f.img.close();
+		frames = [];
+	}
+
+	function detach() {
+		if (video) {
+			video.style.opacity = savedOpacity;
+			if (rvfcId) video.cancelVideoFrameCallback(rvfcId);
+		}
+		rvfcId = 0;
+		if (resizeObs) resizeObs.disconnect();
+		resizeObs = null;
+		if (canvas) canvas.remove();
+		clearFrames();
+		video = canvas = ctx = null;
+		hidden = false;
+	}
+
+	function attach(v) {
+		detach();
+		video = v;
+		failed = false;
+		canvas = document.createElement('canvas');
+		canvas.setAttribute('data-key-changer', 'video-delay');
+		canvas.style.cssText = 'position:absolute;pointer-events:none;margin:0;padding:0;border:0;background:#000;object-fit:contain;visibility:hidden;';
+		v.insertAdjacentElement('afterend', canvas);
+		ctx = canvas.getContext('2d', { alpha: false });
+		ctx.imageSmoothingEnabled = true;
+		ctx.imageSmoothingQuality = 'high';
+		savedOpacity = v.style.opacity;
+		resizeObs = new ResizeObserver(layout);
+		resizeObs.observe(v);
+		layout();
+		rvfcId = v.requestVideoFrameCallback(onFrame);
+	}
+
+	function layout() {
+		if (!video || !canvas) return;
+		const cs = getComputedStyle(video);
+		const W = video.offsetWidth, H = video.offsetHeight;
+		canvas.style.left = video.offsetLeft + 'px';
+		canvas.style.top = video.offsetTop + 'px';
+		canvas.style.width = W + 'px';
+		canvas.style.height = H + 'px';
+		canvas.style.zIndex = cs.zIndex;
+		canvas.style.objectFit = cs.objectFit === 'cover' || cs.objectFit === 'fill' ? cs.objectFit : 'contain';
+		// draw at the size the picture is shown at (device pixels), never above the source.
+		// Until the video knows its size there is nothing to size from: decided on the first
+		// frame (and again whenever the resolution changes: YouTube switches quality).
+		laidOutFor = video.videoWidth + 'x' + video.videoHeight;
+		if (!video.videoWidth || !video.videoHeight) return;
+		const vw = video.videoWidth, vh = video.videoHeight;
+		const s = Math.min((W * devicePixelRatio) / vw, (H * devicePixelRatio) / vh, 1);
+		// copies (fallback mode) of long delays are held in memory: bound their size; held
+		// decoder frames cost nothing extra, so they are drawn at full quality
+		const cap = copyMode && delay > 0.5 ? 1280 : 3840;
+		const w = Math.min(cap, Math.max(2, Math.round(vw * s)));
+		target = { w, h: Math.max(2, Math.round((w * vh) / vw)) };
+	}
+
+	function onFrame(now, meta) {
+		rvfcId = 0;
+		if (!video || !running) return;
+		const v = video;
+		rvfcId = v.requestVideoFrameCallback(onFrame);
+		if (failed || v.readyState < 2) return;
+		if (laidOutFor !== v.videoWidth + 'x' + v.videoHeight || target.w < 3) layout();
+		const gap = lastCb ? now - lastCb : 0;
+		if (gap && gap < 200) interval += 0.1 * (gap - interval);
+		// a long gap while playing with many frames held: the decoder may be starved of buffers
+		if (!copyMode && gap > Math.max(300, 8 * interval) && frames.length > 8 && !v.paused && now - lastSeek > 1500) {
+			if (++stalls >= 2) {
+				copyMode = true;
+				clearFrames();
+			}
+		}
+		lastCb = now;
+		capture(v, now);
+		show(now);
+	}
+
+	function capture(v, now) {
+		if (!copyMode) {
+			try {
+				frames.push({ t: now, img: new VideoFrame(v) });
+			} catch (e) {
+				return copyFrame(v, now);
+			}
+		} else copyFrame(v, now);
+		// keep memory bounded
+		while (frames.length > 240) frames.shift().img.close();
+	}
+
+	async function copyFrame(v, now) {
+		try {
+			const img = await createImageBitmap(v, { resizeWidth: target.w, resizeHeight: target.h, resizeQuality: 'medium' });
+			if (v !== video) return img.close();
+			frames.push({ t: now, img });
+		} catch (e) {
+			// protected (DRM) video: cannot copy frames, so show the video undelayed
+			failed = true;
+			v.style.opacity = savedOpacity;
+			if (canvas) canvas.style.visibility = 'hidden';
+		}
+	}
+
+	// show the newest frame captured at or before now - delay
+	function show(now) {
+		// A frame is only shown when the next one arrives, and a canvas reaches the screen one
+		// frame after the video layer would: aim one frame early so the average lands on time.
+		const due = now - delay * 1000 + interval;
+		let idx = -1;
+		for (let i = 0; i < frames.length && frames[i].t <= due; ++i) idx = i;
+		if (idx < 0) return;
+		for (const f of frames.splice(0, idx)) f.img.close();
+		const f = frames.shift();
+		if (target.w < 3) {
+			// not sized yet (no picture size known): keep the video shown
+			f.img.close();
+			return;
+		}
+		if (canvas.width !== target.w || canvas.height !== target.h) {
+			canvas.width = target.w;
+			canvas.height = target.h;
+			// resizing a canvas resets its state
+			ctx.imageSmoothingEnabled = true;
+			ctx.imageSmoothingQuality = 'high';
+		}
+		ctx.drawImage(f.img, 0, 0, target.w, target.h);
+		f.img.close();
+		lastShown = now;
+		if (!hidden) {
+			canvas.style.visibility = 'visible';
+			video.style.opacity = '0';
+			hidden = true;
+		}
+	}
+
+	// The video element can be swapped by the page (ads, next video, theatre mode): check
+	// for that once a second, not every frame.
+	function watch() {
+		if (!running) return;
+		const v = pickVideo();
+		if (v && v !== video) attach(v);
+		else if (video && !video.isConnected) detach();
+		// after a seek or pause the queue holds stale frames: drop those older than needed
+		if (video && video.paused && frames.length) {
+			const now = performance.now();
+			if (now - lastShown > 2000) clearFrames();
+		}
+	}
+
+	function setDelay(seconds) {
+		const before = delay;
+		delay = Math.min(4, Math.max(0, seconds));
+		if (delay < 0.04) {
+			running = false;
+			clearInterval(pickTimer);
+			detach();
+			return;
+		}
+		if (!running) {
+			running = true;
+			watch();
+			pickTimer = setInterval(watch, 1000);
+		} else if ((before > 0.5) !== (delay > 0.5)) layout();
+	}
+
+	// After a pause the processed sound still plays for `delay` seconds: keep showing the queued
+	// frames until it has caught up (no frame callbacks arrive while paused).
+	function drain() {
+		drainTimer = 0;
+		if (!video || !running || !video.paused || !frames.length) return;
+		show(performance.now());
+		drainTimer = setTimeout(drain, interval);
+	}
+	document.addEventListener('pause', (e) => { if (e.target === video && !drainTimer) drainTimer = setTimeout(drain, interval); }, true);
+
+	// seeking: frames from before the seek must not be shown after it
+	document.addEventListener('seeking', (e) => {
+		if (e.target !== video) return;
+		lastSeek = performance.now();
+		clearFrames();
+	}, true);
+
+	// --- 区間リピート (A-B loop) for practising one part ----------------------------------
+	const loop = { a: null, b: null, on: false, video: null };
+	function loopVideo() {
+		if (loop.video && loop.video.isConnected) return loop.video;
+		return video && video.isConnected ? video : pickVideo();
+	}
+	function loopState() {
+		const v = loopVideo();
+		return { a: loop.a, b: loop.b, on: loop.on, current: v ? v.currentTime : null, duration: v ? v.duration : null, hasVideo: !!v };
+	}
+	function loopCheck() {
+		const v = loop.video;
+		if (!loop.on || !v || loop.a == null || loop.b == null) return;
+		if (v.currentTime >= loop.b || v.currentTime < loop.a - 1) v.currentTime = loop.a;
+	}
+	let loopTimer = 0;
+	function loopTimerSync() {
+		if (loop.on && !loopTimer) loopTimer = setInterval(loopCheck, 50);
+		else if (!loop.on && loopTimer) { clearInterval(loopTimer); loopTimer = 0; }
+	}
+	function loopAction(action) {
+		const v = loopVideo();
+		if (!v) return loopState();
+		loop.video = v;
+		if (action === 'set-a') {
+			loop.a = v.currentTime;
+			if (loop.b != null && loop.b <= loop.a) loop.b = null;
+		} else if (action === 'set-b') {
+			loop.b = v.currentTime;
+			if (loop.a == null || loop.a >= loop.b) loop.a = Math.max(0, loop.b - 10);
+			loop.on = true;
+			v.currentTime = loop.a;
+		} else if (action === 'toggle') {
+			loop.on = !loop.on && loop.a != null && loop.b != null;
+			if (loop.on) v.currentTime = loop.a;
+		} else if (action === 'clear') {
+			loop.a = loop.b = null;
+			loop.on = false;
+		}
+		loopTimerSync();
+		return loopState();
+	}
+
+	chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+		if (!msg) return;
+		if (msg.type === 'video-delay') setDelay(msg.seconds);
+		if (msg.type === 'loop' && window === window.top) sendResponse(loopAction(msg.action));
+	});
+})();

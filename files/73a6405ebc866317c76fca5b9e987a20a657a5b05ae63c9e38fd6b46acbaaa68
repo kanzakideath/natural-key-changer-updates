@@ -1,0 +1,325 @@
+// AudioWorklet that does the actual key change.
+//
+// light mode: input -> pitch engine (formants preserved) -> output
+// hq mode:    input -> (MessagePort) -> separation Worker -> vocals/accompaniment stems
+//             vocals -> Rubber Band (formants preserved), accompaniment -> Signalsmith (ordinary)
+//             -> sum -> output, delayed by a fixed amount so the Worker has time to run.
+// "元の音" (bypass) plays the unprocessed input delayed by the same amount, so A/B
+// switching stays in sync.
+import { WasmEngine, ENGINES } from '../lib/wasm-engine.js';
+
+const Q = 128;
+const RING = 1 << 19; // ~10.9 s @ 48 kHz
+const MASK = RING - 1;
+const BATCH = 1024;
+
+class StereoRing {
+	constructor(size = RING) {
+		this.size = size;
+		this.mask = size - 1;
+		this.l = new Float32Array(size);
+		this.r = new Float32Array(size);
+	}
+	write(pos, l, r, n = l.length) {
+		for (let i = 0; i < n; ++i) {
+			const p = (pos + i) & this.mask;
+			this.l[p] = l[i];
+			this.r[p] = r[i];
+		}
+	}
+	read(pos, l, r, n = l.length) {
+		for (let i = 0; i < n; ++i) {
+			if (pos + i < 0) {
+				l[i] = r[i] = 0;
+				continue;
+			}
+			const p = (pos + i) & this.mask;
+			l[i] = this.l[p];
+			r[i] = this.r[p];
+		}
+	}
+}
+
+class KeyShifterProcessor extends AudioWorkletProcessor {
+	constructor(options) {
+		super();
+		const o = options.processorOptions;
+		this.mode = o.mode;
+		this.modules = {};
+		for (const [file, bytes] of Object.entries(o.modules)) this.modules[file] = new WebAssembly.Module(bytes);
+		this.params = { semitones: o.params.semitones, formant: o.params.formant };
+		this.vocalGain = o.params.vocalGain ?? 1;
+		this.vocalGainNow = this.vocalGain;
+		this.raw = new StereoRing();
+		this.inPos = 0;
+		this.bypass = o.params.bypass ? 1 : 0;
+		this.mixGain = this.bypass; // 0 = processed, 1 = original
+		this.fadeStep = 1 / (0.03 * sampleRate);
+		this.tmp = Array.from({ length: 8 }, () => new Float32Array(Q));
+		this.busyMs = 0;
+		this.underruns = 0;
+		this.lastReport = Date.now();
+		this.reportStart = Date.now();
+
+		if (this.mode === 'hq') {
+			// vocals: full R3 (the short window measured 0.1-0.3 dB worse on the vocal stem);
+			// accompaniment: 60 ms Signalsmith, so the slower path is 100 ms instead of 150 ms
+			// The vocal centre (mid) is all that needs the formant-preserving engine; the vocal side
+			// (mostly stereo reverb) rides with the accompaniment. Halves the heaviest engine's work
+			// at the same measured quality (test/run_mode2.mjs MONO_VOCAL=1: within 0.06 dB).
+			this.engV = this.makeEngine('rubberband-r3', 1);
+			this.engA = this.makeEngine('signalsmith-60');
+			this.updateAlignment();
+			this.prevAlignV = this.alignV;
+			this.prevAlignA = this.alignA;
+			this.alignFade = 1;
+			this.alignRingV = new StereoRing(1 << 15);
+			this.alignRingA = new StereoRing(1 << 15);
+			this.alignTmp = Array.from({ length: 4 }, () => new Float32Array(Q));
+			this.vocals = new StereoRing();
+			this.accomp = new StereoRing();
+			this.stemEnd = 0; // stems are available for [.., stemEnd)
+			this.sepDelay = o.sepDelay; // samples between input and stem playback
+			this.maxSepDelay = o.maxSepDelay;
+			this.batchL = new Float32Array(BATCH);
+			this.batchR = new Float32Array(BATCH);
+			this.batchFill = 0;
+			this.batchStart = 0;
+			this.workerPort = null;
+			this.recentUnderruns = [];
+		} else {
+			this.eng = this.makeEngine(o.engine);
+			this.engineLatency = this.eng.latency;
+		}
+		this.applyParams();
+		this.port.onmessage = (e) => this.onMessage(e.data);
+		this.reportLatency();
+	}
+
+	// Rubber Band's delay changes with the key: keep the two stems lined up (the faster path
+	// is delayed to match the slower one). Changes are crossfaded over ALIGN_FADE samples.
+	updateAlignment() {
+		const lv = this.engV.latency, la = this.engA.latency;
+		this.engineLatency = Math.max(lv, la);
+		this.alignV = this.engineLatency - lv;
+		this.alignA = this.engineLatency - la;
+	}
+
+	makeEngine(id, channels = 2) {
+		const [file, variant] = ENGINES[id];
+		return new WasmEngine(this.modules[file], variant, sampleRate, channels);
+	}
+
+	get totalLatency() {
+		return this.mode === 'hq' ? this.sepDelay + this.engineLatency : this.engineLatency;
+	}
+
+	reportLatency() {
+		this.port.postMessage({ type: 'latency', samples: this.totalLatency, seconds: this.totalLatency / sampleRate });
+	}
+
+	applyParams() {
+		const { semitones, formant } = this.params;
+		// slider "太く" = formants lower; formant param is the extra formant shift in semitones
+		if (this.eng) this.eng.set({ semitones, formantSemitones: formant, preserve: true });
+		if (this.engV) this.engV.set({ semitones, formantSemitones: formant, preserve: true });
+		if (this.engA) this.engA.set({ semitones, formantSemitones: 0, preserve: false });
+	}
+
+	onMessage(msg) {
+		if (msg.type === 'params') {
+			this.params.semitones = msg.semitones;
+			this.params.formant = msg.formant;
+			this.bypass = msg.bypass ? 1 : 0;
+			this.vocalGain = msg.vocalGain ?? 1;
+			const before = this.totalLatency;
+			this.applyParams();
+			if (this.mode === 'hq') {
+				this.prevAlignV = this.alignV;
+				this.prevAlignA = this.alignA;
+				this.updateAlignment();
+				this.alignFade = 0;
+			} else {
+				this.engineLatency = this.eng.latency;
+			}
+			if (this.totalLatency !== before) this.reportLatency();
+			this.port.postMessage({ type: 'applied', semitones: this.params.semitones });
+		} else if (msg.type === 'close') {
+			this.closed = true;
+		} else if (msg.type === 'tap') {
+			// copy of the input for the lyrics analysis (light mode), in 1024-sample batches
+			this.tapPort = msg.port || null;
+			this.tapL = new Float32Array(BATCH);
+			this.tapR = new Float32Array(BATCH);
+			this.tapFill = 0;
+		} else if (msg.type === 'port') {
+			this.workerPort = msg.port;
+			this.workerPort.onmessage = (e) => this.onStems(e.data);
+		}
+	}
+
+	onStems(msg) {
+		if (msg.type !== 'stems') return;
+		const n = msg.vocals[0].length;
+		this.vocals.write(msg.start, msg.vocals[0], msg.vocals[1], n);
+		this.accomp.write(msg.start, msg.accomp[0], msg.accomp[1], n);
+		this.stemEnd = msg.start + n;
+	}
+
+	sendBatch() {
+		if (this.workerPort) {
+			this.workerPort.postMessage({ type: 'audio', start: this.batchStart, l: this.batchL, r: this.batchR }, [this.batchL.buffer, this.batchR.buffer]);
+		}
+		this.batchL = new Float32Array(BATCH);
+		this.batchR = new Float32Array(BATCH);
+		this.batchFill = 0;
+		this.batchStart = this.inPos + Q;
+	}
+
+	processHQ(inL, inR, outL, outR) {
+		// 1. queue input for the separation worker
+		this.batchL.set(inL, this.batchFill);
+		this.batchR.set(inR, this.batchFill);
+		this.batchFill += Q;
+		if (this.batchFill >= BATCH) this.sendBatch();
+
+		// 2. play stems from sepDelay samples ago
+		const [vl, vr, al, ar, pl, pr, ql, qr] = this.tmp;
+		const p = this.inPos - this.sepDelay;
+		if (p + Q <= 0) {
+			vl.fill(0); vr.fill(0); al.fill(0); ar.fill(0);
+		} else if (this.stemEnd >= p + Q) {
+			this.vocals.read(p, vl, vr);
+			this.accomp.read(p, al, ar);
+		} else {
+			// separation is late: output silence, then give it more time
+			vl.fill(0); vr.fill(0); al.fill(0); ar.fill(0);
+			this.onUnderrun();
+		}
+		// mid -> vocal engine; side (scaled with the vocal volume) -> accompaniment engine
+		let g = this.vocalGainNow;
+		const gStep = (this.vocalGain - g) / Q;
+		for (let i = 0; i < Q; ++i) {
+			g += gStep;
+			const mid = (vl[i] + vr[i]) * 0.5, side = (vl[i] - vr[i]) * 0.5 * g;
+			vl[i] = mid;
+			al[i] += side;
+			ar[i] -= side;
+		}
+		this.engV.process([vl], [pl], Q);
+		pr.set(pl);
+		this.engA.process([al, ar], [ql, qr], Q);
+		this.alignRingV.write(this.inPos, pl, pr);
+		this.alignRingA.write(this.inPos, ql, qr);
+		if (this.alignFade < 1) {
+			// crossfade from the old alignment to the new one over this quantum
+			const [ol, or, xl, xr] = this.alignTmp;
+			this.alignRingV.read(this.inPos - this.prevAlignV, ol, or);
+			this.alignRingV.read(this.inPos - this.alignV, pl, pr);
+			this.alignRingA.read(this.inPos - this.prevAlignA, xl, xr);
+			this.alignRingA.read(this.inPos - this.alignA, ql, qr);
+			for (let i = 0; i < Q; ++i) {
+				const w = (i + 1) / Q;
+				pl[i] = ol[i] + (pl[i] - ol[i]) * w;
+				pr[i] = or[i] + (pr[i] - or[i]) * w;
+				ql[i] = xl[i] + (ql[i] - xl[i]) * w;
+				qr[i] = xr[i] + (qr[i] - xr[i]) * w;
+			}
+			this.alignFade = 1;
+		} else {
+			this.alignRingV.read(this.inPos - this.alignV, pl, pr);
+			this.alignRingA.read(this.inPos - this.alignA, ql, qr);
+		}
+		// vocal volume (karaoke / guide vocal), smoothed to avoid clicks
+		g = this.vocalGainNow;
+		for (let i = 0; i < Q; ++i) {
+			g += gStep;
+			outL[i] = pl[i] * g + ql[i];
+			outR[i] = pr[i] * g + qr[i];
+		}
+		this.vocalGainNow = this.vocalGain;
+	}
+
+	onUnderrun() {
+		this.underruns++;
+		const now = currentTime;
+		this.recentUnderruns = this.recentUnderruns.filter((t) => now - t < 10);
+		this.recentUnderruns.push(now);
+		if (this.recentUnderruns.length === 1) {
+			if (this.sepDelay < this.maxSepDelay) {
+				// add 0.15 s of headroom (repeats a moment of audio once)
+				this.sepDelay = Math.min(this.maxSepDelay, this.sepDelay + Math.round(0.15 * sampleRate));
+				this.reportLatency();
+			} else {
+				this.port.postMessage({ type: 'fallback', reason: 'underrun' });
+			}
+		} else if (this.recentUnderruns.length > 40) {
+			// still starving after the delay increase: this computer is too slow for hq mode
+			this.port.postMessage({ type: 'fallback', reason: 'underrun' });
+			this.recentUnderruns = [];
+		}
+	}
+
+	process(inputs, outputs) {
+		if (this.closed) return false;
+		const t0 = Date.now();
+		const input = inputs[0];
+		const out = outputs[0];
+		const inL = input && input[0] ? input[0] : this.tmp[0].fill(0);
+		const inR = input && input[1] ? input[1] : inL;
+		const outL = out[0], outR = out[1] || out[0];
+		this.raw.write(this.inPos, inL, inR, Q);
+		if (this.tapPort) {
+			this.tapL.set(inL, this.tapFill);
+			this.tapR.set(inR, this.tapFill);
+			this.tapFill += Q;
+			if (this.tapFill >= BATCH) {
+				this.tapPort.postMessage({ type: 'audio', start: this.inPos + Q - BATCH, l: this.tapL, r: this.tapR }, [this.tapL.buffer, this.tapR.buffer]);
+				this.tapL = new Float32Array(BATCH);
+				this.tapR = new Float32Array(BATCH);
+				this.tapFill = 0;
+			}
+		}
+
+		if (this.mode === 'hq') {
+			this.processHQ(inL, inR, outL, outR);
+		} else {
+			this.eng.process([inL, inR], [outL, outR], Q);
+		}
+
+		// crossfade with the original (delayed by the same amount)
+		const target = this.bypass;
+		if (target !== 0 || this.mixGain !== 0) {
+			const ol = this.tmp[6], or = this.tmp[7];
+			this.raw.read(this.inPos - this.totalLatency, ol, or);
+			let g = this.mixGain;
+			for (let i = 0; i < Q; ++i) {
+				if (g < target) g = Math.min(target, g + this.fadeStep);
+				else if (g > target) g = Math.max(target, g - this.fadeStep);
+				outL[i] = outL[i] * (1 - g) + ol[i] * g;
+				outR[i] = outR[i] * (1 - g) + or[i] * g;
+			}
+			this.mixGain = g;
+		}
+
+		this.inPos += Q;
+		// tell the main thread once real (not start-up silence) audio comes out, so it can
+		// crossfade to this path
+		if (!this.primedSent && this.inPos >= this.totalLatency + Q && (this.mode !== 'hq' || this.stemEnd > 0)) {
+			this.primedSent = true;
+			this.port.postMessage({ type: 'primed' });
+		}
+		const t1 = Date.now();
+		this.busyMs += t1 - t0;
+		if (t1 - this.lastReport >= 500) {
+			const elapsed = t1 - this.reportStart;
+			this.port.postMessage({ type: 'stats', cpu: this.busyMs / elapsed, underruns: this.underruns, semitones: this.params.semitones, inPos: this.inPos });
+			this.busyMs = 0;
+			this.reportStart = t1;
+			this.lastReport = t1;
+		}
+		return true;
+	}
+}
+
+registerProcessor('key-shifter', KeyShifterProcessor);

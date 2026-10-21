@@ -1,0 +1,8 @@
+// Where updates come from and who may sign them.
+//
+// UPDATE_BASE: folder (https) holding latest.json and files/ (see tools/publish-update.mjs).
+// UPDATE_KEY:  public key (ECDSA P-256) of whoever publishes updates; an update is only taken
+//              when its signature checks out against this key, wherever it was downloaded from.
+export const UPDATE_BASE = 'https://raw.githubusercontent.com/kanzakideath/natural-key-changer-updates/main/';
+export const UPDATE_KEY = { kty: 'EC', crv: 'P-256', x: 'SDD-rUVc2kXot8Hd1UKFCDGaYOTa4dJx5eoJkqBlJQU', y: 'uSOM20bjp0d6phggYM2SOA4dh4RhJNTea5C07fBh5Ho' };
+export const CHECK_EVERY_MIN = 180;

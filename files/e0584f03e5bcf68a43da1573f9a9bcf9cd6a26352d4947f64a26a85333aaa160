@@ -1,0 +1,79 @@
+:root {
+	--bg: #f2f2f7; --card: #fff; --fill: rgba(118, 118, 128, 0.12); --fill-2: rgba(118, 118, 128, 0.2);
+	--text: #000; --text-2: rgba(60, 60, 67, 0.62); --tint: #5856d6; --tint-soft: rgba(88, 86, 214, 0.12);
+	--on: #34c759; --red: #ff3b30;
+	--spring: cubic-bezier(0.34, 1.56, 0.64, 1); --ease: cubic-bezier(0.32, 0.72, 0, 1);
+	color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+	:root {
+		--bg: #000; --card: #1c1c1e; --fill: rgba(118, 118, 128, 0.24); --fill-2: rgba(118, 118, 128, 0.36);
+		--text: #fff; --text-2: rgba(235, 235, 245, 0.62); --tint: #7d7aff; --tint-soft: rgba(125, 122, 255, 0.18);
+		--on: #30d158; --red: #ff453a; color-scheme: dark;
+	}
+}
+* { box-sizing: border-box; }
+body {
+	margin: 0; background: var(--bg); color: var(--text); text-wrap: pretty;
+	font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Meiryo UI", "Noto Sans JP", "Noto Sans CJK JP", system-ui, sans-serif;
+	-webkit-font-smoothing: antialiased;
+}
+main { max-width: 640px; margin: 0 auto; padding: 32px 16px 56px; display: flex; flex-direction: column; gap: 16px; }
+header { display: flex; gap: 14px; align-items: center; }
+h1 { margin: 0; font-size: 26px; font-weight: 600; }
+h2 { margin: 0 0 12px; font-size: 15px; font-weight: 500; color: var(--text-2); }
+.lead { margin: 2px 0 0; color: var(--text-2); font-size: 14px; }
+.card { background: var(--card); border-radius: 20px; padding: 20px; }
+svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
+.live-note { text-align: center; padding: 6px 0 14px; }
+.note-big { font-size: 56px; font-weight: 600; line-height: 1.1; font-variant-numeric: tabular-nums; transition: color 0.2s; min-height: 62px; }
+.note-big.stable { color: var(--tint); }
+.note-sub { color: var(--text-2); font-size: 13px; min-height: 21px; }
+
+.ruler-wrap { margin: 4px 0 16px; }
+.ruler { position: relative; height: 34px; border-radius: 10px; background: var(--fill); overflow: hidden; }
+.ruler-range {
+	position: absolute; top: 0; bottom: 0; left: 0; width: 0; background: var(--tint-soft);
+	border-left: 3px solid var(--tint); border-right: 3px solid var(--tint);
+	transition: left 0.5s var(--spring), width 0.5s var(--spring);
+}
+.ruler-marker {
+	position: absolute; top: 4px; bottom: 4px; width: 6px; margin-left: -3px; border-radius: 3px; background: var(--on);
+	opacity: 0; transition: left 0.12s linear, opacity 0.2s;
+}
+.ruler-marker.show { opacity: 1; }
+.ruler-labels { position: relative; height: 18px; font-size: 11px; color: var(--text-2); }
+.ruler-labels span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+
+.actions { display: flex; gap: 10px; }
+.btn {
+	font: inherit; font-size: 15px; font-weight: 500; border: 0; cursor: pointer; display: inline-flex; align-items: center; gap: 8px;
+	padding: 11px 18px; border-radius: 14px; background: var(--fill); color: var(--tint);
+	transition: transform 0.35s var(--spring), background-color 0.25s;
+}
+.btn:active { transform: scale(0.95); transition-duration: 0.08s; }
+.btn.primary { background: var(--tint); color: #fff; }
+.btn.recording { background: var(--red); }
+.btn.recording svg { animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 50% { transform: scale(0.8); opacity: 0.6; } }
+.btn:focus-visible, select:focus-visible { outline: 3px solid var(--tint-soft); outline-offset: 2px; }
+
+.steps { margin: 16px 0 6px; padding-left: 22px; color: var(--text-2); font-size: 14px; }
+.steps b { color: var(--text); font-weight: 500; }
+.note { margin: 6px 0 0; font-size: 13px; color: var(--text-2); }
+
+.pick-row { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+.pick-row label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--text-2); flex: 1; min-width: 160px; }
+.dash { padding-bottom: 10px; color: var(--text-2); }
+select {
+	font: inherit; font-size: 17px; font-weight: 500; color: var(--text); padding: 9px 12px; border-radius: 12px;
+	border: 0; background: var(--fill); appearance: none; cursor: pointer;
+}
+.save-row { display: flex; align-items: center; justify-content: flex-end; gap: 14px; margin-top: 18px; }
+.saved { color: var(--on); font-size: 14px; opacity: 0; transform: translateX(6px); transition: opacity 0.3s, transform 0.4s var(--spring); }
+.saved.show { opacity: 1; transform: none; }
+
+@media (prefers-reduced-motion: reduce) {
+	*, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}

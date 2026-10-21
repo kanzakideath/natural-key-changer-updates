@@ -1,0 +1,588 @@
+import { DEFAULTS, LIGHT_ENGINES, loadSettings, saveSettings, loadSongs, saveSong, deleteSong, loadVoice } from '../lib/settings.js';
+import { karaoke, scientific, NoteHistogram, recommendKey } from '../lib/notes.js';
+import { t, localize, isJapanese } from '../lib/i18n.js';
+
+const $ = (id) => document.getElementById(id);
+let settings = { ...DEFAULTS };
+let state = { active: false, tabId: null };
+let tab = null;
+let sendTimer = null;
+let lastNotice = '';
+let shownKey = null;
+let lastRoll = 0;
+let localEdits = 0; // settings changes made here that are not saved yet
+let lastLocalEdit = 0;
+let keyConfirm = null; // 'pending' | 'done' | null: whether the audio already uses the key on screen
+let keyConfirmTimer = null;
+let songs = {};
+let voice = null;
+let songRange = null; // {low, high, seconds} in the original key
+let lastStatus = null;
+let loop = { a: null, b: null, on: false };
+
+const MODE_HINT = { light: 'hintLight', hq: 'hintHq' };
+// karaoke range notation (mid2G, hiA) in Japanese, scientific pitch (G4, A4) elsewhere
+const noteName = (m) => (isJapanese() ? karaoke(m) : scientific(m));
+// notices from the audio engine arrive as codes
+const NOTICE = { preparing: 'noticePreparing', hqUnavailable: 'noticeHqUnavailable', fallbackUnderrun: 'noticeFallbackUnderrun', fallbackError: 'noticeFallbackError' };
+const MEASURE_MIN_SECONDS = 15; // singing time needed before the range is trusted
+
+const bg = (type, extra = {}) => chrome.runtime.sendMessage({ target: 'background', type, ...extra });
+const signed = (n) => (n > 0 ? '+' + n : n < 0 ? '−' + Math.abs(n) : '0');
+const onHere = () => state.active && state.tabId === tab?.id;
+const songId = () => (onHere() && state.song ? state.song.id : null);
+const mmss = (t) => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, '0')}`;
+
+// ---------- small animation helpers ----------
+function rollKey(n) {
+	const roller = $('keyRoller');
+	if (shownKey === n) return;
+	const now = performance.now();
+	// quick successive changes: just swap the number (with a small tick) instead of stacking slide animations
+	const quick = shownKey == null || now - lastRoll < 350 || matchMedia('(prefers-reduced-motion: reduce)').matches;
+	const dir = shownKey == null || n > shownKey ? 'up' : 'down';
+	lastRoll = now;
+	shownKey = n;
+	// at most one number on screen: anything still sliding out goes now
+	for (const e of roller.querySelectorAll('.key-num.leave-up, .key-num.leave-down')) e.remove();
+	let cur = roller.querySelector('.key-num');
+	if (!cur) {
+		cur = document.createElement('span');
+		roller.append(cur);
+	}
+	if (quick) {
+		cur.className = 'key-num';
+		cur.textContent = signed(n);
+		void cur.offsetWidth; // restart the tick animation
+		cur.classList.add('tick');
+		return;
+	}
+	const el = document.createElement('span');
+	el.className = 'key-num enter-' + dir;
+	el.textContent = signed(n);
+	cur.className = 'key-num leave-' + dir;
+	cur.addEventListener('animationend', () => cur.remove(), { once: true });
+	setTimeout(() => cur.remove(), 400); // in case animationend never fires
+	roller.append(el);
+}
+
+// shows under the key whether the sound already uses it
+function setKeyConfirm(next) {
+	if (next === keyConfirm) return;
+	clearTimeout(keyConfirmTimer);
+	keyConfirm = next;
+	const u = $('keyUnit');
+	u.classList.toggle('pending', next === 'pending');
+	u.classList.toggle('done', next === 'done');
+	u.textContent = next === 'pending' ? t('keyApplying') : next === 'done' ? t('keyApplied') : t('semitones');
+	if (next === 'done') keyConfirmTimer = setTimeout(() => setKeyConfirm(null), 1400);
+}
+
+function setRangeFill(input) {
+	const min = Number(input.min), max = Number(input.max);
+	input.style.setProperty('--pct', ((Number(input.value) - min) / (max - min)) * 100 + '%');
+}
+
+// notices appear inside the mode card (never on top of other controls)
+let noticeTimer = null;
+function notify(text, { info = false, ms = 8000 } = {}) {
+	clearTimeout(noticeTimer);
+	const el = $('notice');
+	if (!text) {
+		el.hidden = true;
+		document.body.classList.remove('has-notice');
+		return;
+	}
+	$('noticeText').textContent = text;
+	el.classList.toggle('info', info);
+	el.hidden = false;
+	document.body.classList.add('has-notice');
+	if (ms) noticeTimer = setTimeout(() => notify(''), ms);
+}
+
+// ---------- render ----------
+function render() {
+	const here = onHere();
+	document.body.classList.toggle('is-on', here);
+	document.body.classList.toggle('is-off', !here);
+	document.body.classList.toggle('mode-light', settings.mode !== 'hq');
+	$('power').checked = here;
+	$('powerSub').textContent = t(state.active && !here ? 'turnOnSubOther' : 'turnOnSub');
+
+	rollKey(settings.semitones);
+	$('key').value = settings.semitones;
+	setRangeFill($('key'));
+	$('keyReset').hidden = settings.semitones === 0;
+	$('keyDown').disabled = settings.semitones <= -12;
+	$('keyUp').disabled = settings.semitones >= 12;
+
+	const f = -settings.formant; // slider right = deeper = formants lower
+	$('formant').value = f;
+	setRangeFill($('formant'));
+	$('formantValue').textContent = f === 0 ? t('formantKeep') : t(f > 0 ? 'formantThick' : 'formantThin') + ' ' + Math.abs(f).toFixed(1);
+	$('formantReset').hidden = f === 0;
+
+	const idx = settings.mode === 'hq' ? 1 : 0;
+	$('segThumb').style.transform = `translateX(${idx * 100}%)`;
+	for (const b of document.querySelectorAll('.segmented button')) b.setAttribute('aria-checked', String(b.dataset.mode === settings.mode));
+	const hint = $('modeHint');
+	if (hint.dataset.mode !== settings.mode) {
+		const first = !hint.dataset.mode;
+		hint.dataset.mode = settings.mode;
+		hint.classList.add('swap');
+		setTimeout(() => {
+			hint.textContent = t(MODE_HINT[settings.mode]);
+			hint.classList.remove('swap');
+		}, first ? 0 : 150);
+	}
+
+	$('bypass').setAttribute('aria-pressed', String(settings.bypass));
+	$('bypass').disabled = !here;
+	$('abTitle').textContent = t(settings.bypass ? 'abTitleOn' : 'abTitle');
+	$('abSub').textContent = t(here ? (settings.bypass ? 'abSubOn' : 'abSub') : 'abSubOff');
+
+	$('videoSync').checked = settings.videoSync;
+	$('lyricsOn').checked = settings.lyrics !== false;
+	$('lyricsAi').checked = settings.lyricsAi !== false;
+	$('lyricsAi').disabled = settings.lyrics === false;
+	$('autoUpdate').checked = settings.autoUpdate !== false;
+	$('lyricsHeard').checked = !!settings.lyricsHeard;
+	$('lyricsHeard').disabled = settings.lyrics === false || settings.lyricsAi === false;
+	$('autoKey').checked = settings.autoKey;
+	for (const r of document.querySelectorAll('.engine-row')) r.setAttribute('aria-checked', String(r.dataset.engine === settings.engine));
+
+	// practice tab
+	const v = Math.round(settings.vocalGain * 100);
+	$('vocal').value = v;
+	setRangeFill($('vocal'));
+	$('vocalValue').textContent = v === 0 ? t('vocalKaraoke') : v + '%';
+	for (const c of document.querySelectorAll('.choice')) c.setAttribute('aria-pressed', String(Number(c.dataset.vocal) === v));
+	renderRange();
+	renderLoop();
+	$('songCount').textContent = Object.keys(songs).length ? t('songCount', Object.keys(songs).length) : '';
+}
+
+// ---------- vocal range & key suggestion ----------
+const G_LO = 36, G_HI = 84; // graph axis: C2 .. C6
+const gx = (m) => ((Math.min(G_HI, Math.max(G_LO, m)) - G_LO) / (G_HI - G_LO)) * 100;
+
+function placeBar(el, lo, hi) {
+	if (lo == null || hi == null) {
+		el.classList.add('empty');
+		return;
+	}
+	el.classList.remove('empty');
+	el.style.left = gx(lo) + '%';
+	el.style.width = Math.max(1.5, gx(hi) - gx(lo)) + '%';
+}
+
+function renderRange() {
+	const k = settings.semitones;
+	const r = songRange && songRange.seconds >= MEASURE_MIN_SECONDS ? songRange : null;
+	const s = lastStatus;
+	let measure = '';
+	if (!onHere()) measure = t(r ? 'measureSaved' : 'measureOff');
+	else if (settings.mode !== 'hq' || (s && s.mode !== 'hq')) measure = t(r ? 'measureSaved' : 'measureHqOnly');
+	else if (!songRange || songRange.seconds < MEASURE_MIN_SECONDS) measure = t('measureProgress', Math.min(99, Math.round(((songRange && songRange.seconds) || 0) / MEASURE_MIN_SECONDS * 100)));
+	else measure = t('measureDone', Math.round(songRange.seconds));
+	$('measureState').textContent = measure;
+
+	placeBar($('barSong'), r && r.low + k, r && r.high + k);
+	placeBar($('barVoice'), voice && voice.low, voice && voice.high);
+	$('songRange').textContent = r ? `${noteName(r.low + k)} – ${noteName(r.high + k)}` : '–';
+	$('songRange').title = r && k ? `${noteName(r.low)} – ${noteName(r.high)} (${t('keyReset')})` : '';
+	$('voiceRange').textContent = voice ? `${noteName(voice.low)} – ${noteName(voice.high)}` : t('notSet');
+	$('editVoice').textContent = t(voice ? 'edit' : 'register');
+
+	const box = $('recommend');
+	const rec = r && voice ? recommendKey(r, voice) : null;
+	$('barSong').classList.toggle('over', !!(r && voice && r.high + k > voice.high));
+	if (!rec) {
+		box.classList.remove('has');
+		$('applyRec').hidden = true;
+		$('recText').textContent = t(!voice ? 'recNeedVoice' : 'recNeedSong');
+		return;
+	}
+	box.classList.add('has');
+	const same = rec.key === k;
+	$('applyRec').hidden = same;
+	const extra = rec.fits ? '' : rec.over ? t('recOver', rec.over) : t('recUnder', rec.under);
+	// the key number is emphasised: split the sentence around it
+	const MARK = '{KEY}';
+	const sentence = t(same ? 'recCurrent' : 'recSuggest', MARK);
+	const [before, after = ''] = sentence.split(MARK);
+	const box2 = $('recText');
+	box2.textContent = '';
+	const b = document.createElement('b');
+	b.textContent = signed(rec.key);
+	box2.append(before, b, after + extra);
+	$('applyRec').dataset.key = rec.key;
+}
+
+function updateSongRange(status) {
+	const id = songId();
+	if (status && status.melody && status.mode === 'hq') {
+		const h = new NoteHistogram();
+		h.merge(status.melody.bins);
+		const r = h.range();
+		if (r) {
+			songRange = r;
+			// remember it with the song once it is reliable
+			if (id && r.seconds >= MEASURE_MIN_SECONDS) {
+				const saved = songs[id] && songs[id].range;
+				if (!saved || Math.abs(saved.seconds - r.seconds) > 10 || saved.low !== r.low || saved.high !== r.high) {
+					songs[id] = { ...(songs[id] || {}), range: r };
+					saveSong(id, { range: r, title: state.song.title, url: state.song.url });
+				}
+			}
+			return;
+		}
+	}
+	if ((!songRange || songRange.seconds < MEASURE_MIN_SECONDS) && id && songs[id] && songs[id].range) songRange = songs[id].range;
+}
+
+// ---------- A-B repeat ----------
+async function ensureContent() {
+	try {
+		await chrome.tabs.sendMessage(tab.id, { type: 'loop', action: 'get' });
+		return true;
+	} catch (e) {
+		try {
+			await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content/video-delay.js'] });
+			return true;
+		} catch (e2) {
+			return false;
+		}
+	}
+}
+
+async function loopAction(action) {
+	if (!(await ensureContent())) {
+		if (action !== 'get') notify(t('noticeLoop'));
+		return;
+	}
+	const res = await chrome.tabs.sendMessage(tab.id, { type: 'loop', action }).catch(() => null);
+	if (res) {
+		loop = res;
+		if (!res.hasVideo && action !== 'get') notify(t('noticeNoVideo'));
+	}
+	renderLoop();
+}
+
+function renderLoop() {
+	$('loopAText').textContent = loop.a != null ? mmss(loop.a) : t('loopFrom');
+	$('loopBText').textContent = loop.b != null ? mmss(loop.b) : t('loopTo');
+	$('loopA').classList.toggle('set', loop.a != null);
+	$('loopB').classList.toggle('set', loop.b != null);
+	$('loopOn').checked = !!loop.on;
+	$('loopOn').disabled = loop.a == null || loop.b == null;
+	document.body.classList.toggle('loop-on', !!loop.on);
+}
+
+// ---------- key book ----------
+function renderSongs() {
+	const list = $('songList');
+	list.innerHTML = '';
+	const entries = Object.entries(songs).filter(([, s]) => typeof s.key === 'number').sort((a, b) => (b[1].savedAt || 0) - (a[1].savedAt || 0));
+	$('songEmpty').hidden = entries.length > 0;
+	for (const [id, s] of entries) {
+		const row = document.createElement('div');
+		row.className = 'song-row' + (id === songId() ? ' current' : '');
+		const range = s.range ? `${noteName(s.range.low)}–${noteName(s.range.high)} · ` : '';
+		const date = s.savedAt ? new Date(s.savedAt).toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' }) : '';
+		row.innerHTML = `<div class="song-info"><div class="song-title"></div><div class="song-meta">${range}${date}</div></div>
+			<span class="song-key">${signed(s.key)}</span>
+			<button class="icon-btn small" type="button" aria-label="${t('delete')}"><svg viewBox="0 0 24 24"><path d="M4 7h16" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M6 7l1 13h10l1-13" /><path d="M9 7V4h6v3" /></svg></button>`;
+		const title = row.querySelector('.song-title');
+		title.textContent = s.title || id;
+		title.dataset.now = t('nowPlaying');
+		title.title = s.title || id;
+		row.querySelector('button').addEventListener('click', async () => {
+			row.classList.add('removing');
+			await deleteSong(id);
+			delete songs[id];
+			setTimeout(() => { row.remove(); $('songEmpty').hidden = list.children.length > 0; render(); }, 350);
+		});
+		list.append(row);
+	}
+}
+
+// ---------- updates ----------
+async function paintUpdate() {
+	const { updateAvailable } = await chrome.storage.local.get('updateAvailable');
+	const mine = chrome.runtime.getManifest().version;
+	const newer = updateAvailable && updateAvailable.version !== mine ? updateAvailable : null;
+	$('updRow').textContent = newer ? t('updRowAvailable', newer.version) : t('updRowVersion', mine);
+	$('updRow').style.fontWeight = newer ? '600' : '';
+	$('updRow').style.color = newer ? 'var(--tint)' : '';
+	$('openSheet').classList.toggle('has-update', !!newer);
+}
+
+// ---------- settings / status ----------
+function change(patch, { immediate = false } = {}) {
+	if (patch.mode && patch.mode !== settings.mode) {
+		notify('');
+		lastNotice = '';
+	}
+	Object.assign(settings, patch);
+	if (patch.semitones !== undefined && settings.autoKey && songId()) {
+		songs[songId()] = { ...(songs[songId()] || {}), key: settings.semitones, title: state.song.title, savedAt: Date.now() };
+	}
+	render();
+	clearTimeout(sendTimer);
+	lastLocalEdit = performance.now();
+	if (patch.semitones !== undefined && onHere()) setKeyConfirm('pending');
+	const send = async () => {
+		sendTimer = null;
+		localEdits++;
+		try {
+			await saveSettings(settings);
+			await bg('settings', { settings: { ...settings } });
+		} finally {
+			localEdits--;
+		}
+	};
+	if (immediate) send();
+	else sendTimer = setTimeout(send, 40);
+}
+
+function loadText(x) {
+	if (x < 0.5) return [t('loadLow'), 'ok'];
+	if (x < 0.8) return [t('loadMid'), 'mid'];
+	return [t('loadHigh'), 'high'];
+}
+
+async function poll() {
+	if (!onHere()) return;
+	let res;
+	try {
+		res = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'status' });
+	} catch (e) {
+		return;
+	}
+	if (!res || !res.ok) return;
+	const s = res.status;
+	lastStatus = s;
+	const fellBack = s.notice === 'fallbackUnderrun' || s.notice === 'fallbackError' || s.notice === 'hqUnavailable';
+	const preparing = settings.mode === 'hq' && s.mode !== 'hq' && !fellBack;
+	$('modeLabel').textContent = t(preparing ? 'preparing' : s.mode === 'hq' ? 'modeHq' : 'modeLight');
+	$('modeDot').className = preparing ? 'dot spinner' : 'dot live';
+	$('latency').textContent = s.latency ? t('seconds', s.latency.toFixed(2)) : '–';
+	const [label, cls] = loadText(Math.max(s.cpuAudio || 0, s.cpuAI || 0));
+	$('loadLabel').textContent = label;
+	$('loadDot').className = 'dot ' + cls;
+	$('statusBar').title = `audio ${Math.round(s.cpuAudio * 100)}% · AI ${Math.round(s.cpuAI * 100)}%` + (s.backend ? ` (${s.backend})` : '');
+
+	const code = s.error ? 'error' : s.notice || (preparing ? 'preparing' : '');
+	if (code !== lastNotice) {
+		if (code === 'error') notify(t('noticeStartFailed', s.error));
+		else if (code) notify(t(NOTICE[code] || code), { info: code === 'preparing', ms: code === 'preparing' ? 0 : 8000 });
+		else if (lastNotice === 'preparing') notify('');
+	}
+	lastNotice = code;
+	if (s.mode === 'light' && settings.mode === 'hq' && fellBack) {
+		// automatic fallback happened: reflect it in the controls
+		settings.mode = 'light';
+		await saveSettings(settings);
+	}
+	// the background may have restored a remembered key (new song) or a shortcut changed it;
+	// never while a change made here is still on its way (that would flick the key back)
+	const quiet = () => !sendTimer && localEdits === 0 && performance.now() - lastLocalEdit > 800;
+	if (quiet()) {
+		const stored = await loadSettings();
+		if (quiet()) {
+			settings.semitones = stored.semitones;
+			settings.bypass = stored.bypass;
+		}
+	}
+	if (typeof s.semitones === 'number') {
+		if (s.semitones === settings.semitones) {
+			if (keyConfirm === 'pending') setKeyConfirm('done');
+		} else if (quiet() || keyConfirm === 'pending') {
+			setKeyConfirm('pending');
+		}
+	}
+	const st = await bg('state');
+	if (st.song && state.song && st.song.id !== state.song.id) {
+		songRange = null;
+		songs = await loadSongs();
+	}
+	state = st;
+	updateSongRange(s);
+	render();
+}
+
+// pages where Chrome does not allow capture / scripting
+function isRestricted() {
+	const url = (tab && (tab.url || tab.pendingUrl)) || '';
+	return /^(chrome|edge|about|chrome-extension|devtools|view-source):/.test(url) || /chromewebstore\.google\.com|chrome\.google\.com\/webstore/.test(url);
+}
+
+async function showShortcuts() {
+	try {
+		const cmds = Object.fromEntries((await chrome.commands.getAll()).map((c) => [c.name, c.shortcut]));
+		// Chrome spells arrow keys out in the UI language ("Up Arrow", "上矢印キー"): show arrows instead
+		const fmt = (s) => (s || '—').replace(/Up Arrow|上矢印キー|\bUp\b/g, '↑').replace(/Down Arrow|下矢印キー|\bDown\b/g, '↓').replace(/Left Arrow|左矢印キー/g, '←').replace(/Right Arrow|右矢印キー/g, '→');
+		const up = fmt(cmds['key-up']), down = fmt(cmds['key-down']);
+		const pre = up.slice(0, up.lastIndexOf('+') + 1);
+		$('scKey').textContent = pre && down.startsWith(pre) && down !== '—' ? `${up} / ${down.slice(pre.length)}` : `${up} / ${down}`;
+		$('scBypass').textContent = fmt(cmds['toggle-bypass']);
+		$('scOpen').textContent = fmt(cmds._execute_action);
+	} catch (e) { /* keep defaults */ }
+}
+
+async function setPower(on) {
+	$('power').disabled = true;
+	$('powerBig').classList.toggle('busy', on);
+	try {
+		const res = await bg(on ? 'start' : 'stop', on ? { tabId: tab.id } : {});
+		if (res && res.ok === false) throw new Error(res.error);
+	} catch (e) {
+		const msg = String(e.message || e);
+		notify(/cannot be captured|chrome:\/\/|Chrome pages|webstore|extension/i.test(msg) || isRestricted() ? t('noticeRestricted') : t('noticeStartFailed', msg));
+	}
+	state = await bg('state');
+	settings = await loadSettings(); // the key may have been restored for this song
+	songs = await loadSongs();
+	songRange = null;
+	updateSongRange(null);
+	$('power').disabled = false;
+	$('powerBig').classList.remove('busy');
+	render();
+	poll();
+}
+
+// ---------- tabs & sheets ----------
+function showTab(name) {
+	document.body.classList.toggle('tab-key', name === 'key');
+	document.body.classList.toggle('tab-practice', name === 'practice');
+	for (const t of document.querySelectorAll('.tab')) t.setAttribute('aria-selected', String(t.dataset.tab === name));
+	$('viewKey').inert = name !== 'key';
+	$('viewPractice').inert = name !== 'practice';
+	$('viewTitle').textContent = t(name === 'key' ? 'titleKey' : 'titlePractice');
+	try { localStorage.setItem('tab', name); } catch (e) { /* storage unavailable */ }
+	if (name === 'practice' && onHere()) loopAction('get');
+}
+
+let openSheetEl = null;
+function openSheet(sheet) {
+	openSheetEl = sheet;
+	document.body.classList.toggle('sheet-open', !!sheet);
+	for (const s of document.querySelectorAll('.sheet')) {
+		s.classList.toggle('open', s === sheet);
+		s.inert = s !== sheet;
+	}
+	if (sheet) sheet.querySelector('[data-close]').focus();
+}
+
+function enableSheetDrag(sheet) {
+	const grabber = sheet.querySelector('.grabber');
+	let startY = null, dy = 0;
+	grabber.addEventListener('pointerdown', (e) => {
+		startY = e.clientY;
+		dy = 0;
+		sheet.classList.add('dragging');
+		grabber.setPointerCapture(e.pointerId);
+	});
+	grabber.addEventListener('pointermove', (e) => {
+		if (startY == null) return;
+		dy = Math.max(0, e.clientY - startY);
+		sheet.style.transform = `translateY(${dy}px)`;
+	});
+	const end = () => {
+		if (startY == null) return;
+		startY = null;
+		sheet.classList.remove('dragging');
+		sheet.style.transform = '';
+		if (dy > 80) openSheet(null);
+	};
+	grabber.addEventListener('pointerup', end);
+	grabber.addEventListener('pointercancel', end);
+}
+
+async function init() {
+	[tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+	settings = await loadSettings();
+	state = await bg('state');
+	songs = await loadSongs();
+	voice = await loadVoice();
+	updateSongRange(null);
+
+	localize();
+	showShortcuts();
+	for (const [id, label] of LIGHT_ENGINES) {
+		const b = document.createElement('button');
+		b.type = 'button';
+		b.className = 'group-row engine-row';
+		b.dataset.engine = id;
+		b.setAttribute('role', 'radio');
+		b.innerHTML = `<span>${t(label)}</span><svg class="check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>`;
+		b.addEventListener('click', () => change({ engine: id }, { immediate: true }));
+		$('engineList').append(b);
+	}
+	let startTab = 'key';
+	try { startTab = localStorage.getItem('tab') || 'key'; } catch (e) { /* storage unavailable */ }
+	showTab(startTab);
+	render();
+
+	$('power').addEventListener('change', (e) => setPower(e.target.checked));
+	$('powerBig').addEventListener('click', () => setPower(true));
+	$('key').addEventListener('input', (e) => change({ semitones: Number(e.target.value) }));
+	$('keyDown').addEventListener('click', () => change({ semitones: Math.max(-12, settings.semitones - 1) }));
+	$('keyUp').addEventListener('click', () => change({ semitones: Math.min(12, settings.semitones + 1) }));
+	$('keyReset').addEventListener('click', () => change({ semitones: 0 }));
+	$('formant').addEventListener('input', (e) => change({ formant: -Number(e.target.value) }));
+	$('formantReset').addEventListener('click', () => change({ formant: 0 }));
+	for (const b of document.querySelectorAll('.segmented button')) {
+		b.addEventListener('click', () => change({ mode: b.dataset.mode }, { immediate: true }));
+	}
+	$('bypass').addEventListener('click', () => change({ bypass: !settings.bypass }, { immediate: true }));
+	$('videoSync').addEventListener('change', (e) => change({ videoSync: e.target.checked }, { immediate: true }));
+	$('lyricsOn').addEventListener('change', (e) => change({ lyrics: e.target.checked }, { immediate: true }));
+	$('autoUpdate').addEventListener('change', (e) => change({ autoUpdate: e.target.checked }, { immediate: true }));
+	const openUpdate = () => chrome.tabs.create({ url: chrome.runtime.getURL('update/update.html') });
+	$('openUpdate').addEventListener('click', openUpdate);
+	$('openUpdate').addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') openUpdate(); });
+	paintUpdate();
+	$('lyricsAi').addEventListener('change', (e) => change({ lyricsAi: e.target.checked }, { immediate: true }));
+	$('lyricsHeard').addEventListener('change', (e) => change({ lyricsHeard: e.target.checked }, { immediate: true }));
+	$('autoKey').addEventListener('change', (e) => change({ autoKey: e.target.checked }, { immediate: true }));
+
+	$('vocal').addEventListener('input', (e) => change({ vocalGain: Number(e.target.value) / 100 }));
+	for (const c of document.querySelectorAll('.choice')) c.addEventListener('click', () => change({ vocalGain: Number(c.dataset.vocal) / 100 }, { immediate: true }));
+	$('toHq').addEventListener('click', () => change({ mode: 'hq' }, { immediate: true }));
+	$('applyRec').addEventListener('click', () => change({ semitones: Number($('applyRec').dataset.key) }, { immediate: true }));
+	$('editVoice').addEventListener('click', () => chrome.tabs.create({ url: chrome.runtime.getURL('range/range.html') }));
+	$('loopA').addEventListener('click', () => loopAction('set-a'));
+	$('loopB').addEventListener('click', () => loopAction('set-b'));
+	$('loopClear').addEventListener('click', () => loopAction('clear'));
+	$('loopOn').addEventListener('change', () => loopAction('toggle'));
+	$('scChange').addEventListener('click', () => chrome.tabs.create({ url: 'chrome://extensions/shortcuts' }));
+	if (!onHere() && tab && tab.audible === false && !isRestricted()) notify(t('noticeNoAudio'), { info: true, ms: 0 });
+	if (isRestricted()) notify(t('noticeRestricted'), { ms: 0 });
+
+	for (const t of document.querySelectorAll('.tab')) t.addEventListener('click', () => showTab(t.dataset.tab));
+	$('openSheet').addEventListener('click', () => openSheet($('sheet')));
+	$('openSongs').addEventListener('click', () => { renderSongs(); openSheet($('songsSheet')); });
+	for (const b of document.querySelectorAll('[data-close]')) b.addEventListener('click', () => openSheet(null));
+	$('backdrop').addEventListener('click', () => openSheet(null));
+	for (const s of document.querySelectorAll('.sheet')) enableSheetDrag(s);
+	document.addEventListener('keydown', (e) => {
+		if (e.key === 'Escape' && openSheetEl) {
+			e.preventDefault();
+			openSheet(null);
+			return;
+		}
+		if (e.target.tagName === 'INPUT') return;
+		if (e.key === 'ArrowUp') change({ semitones: Math.min(12, settings.semitones + 1) });
+		if (e.key === 'ArrowDown') change({ semitones: Math.max(-12, settings.semitones - 1) });
+	});
+	chrome.storage.onChanged.addListener((ch) => {
+		if (ch.voice) { voice = ch.voice.newValue || null; render(); }
+	});
+
+	poll();
+	setInterval(poll, 250);
+}
+
+init();

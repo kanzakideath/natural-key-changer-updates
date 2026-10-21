@@ -1,0 +1,82 @@
+// LRC lyrics parser.
+//   [mm:ss.xx]line             one line
+//   [mm:ss.xx][mm:ss.xx]line   the same line at several times (choruses)
+//   [mm:ss.xx]<mm:ss.xx>word <mm:ss.xx>word   word timing ("enhanced" LRC)
+//   [offset:+250]              shift in ms (positive = lyrics earlier)
+// Lines with a time but no text mark instrumental parts.
+(function (root) {
+	const KCL = (root.KCL = root.KCL || {});
+	const TAG = /\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]/g;
+	const WORD = /<(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?>/g;
+
+	const secs = (m, s, f) => Number(m) * 60 + Number(s) + (f ? Number(f) / 10 ** f.length : 0);
+
+	function parseWords(text) {
+		const marks = [];
+		WORD.lastIndex = 0;
+		let m;
+		while ((m = WORD.exec(text))) marks.push({ at: m.index, after: WORD.lastIndex, t: secs(m[1], m[2], m[3]) });
+		if (!marks.length) return null;
+		const words = [];
+		for (let i = 0; i < marks.length; ++i) {
+			const w = text.slice(marks[i].after, i + 1 < marks.length ? marks[i + 1].at : text.length);
+			const end = i + 1 < marks.length ? marks[i + 1].t : undefined;
+			if (w) words.push({ t: marks[i].t, end, text: w });
+			else if (words.length && words[words.length - 1].end == null) words[words.length - 1].end = marks[i].t;
+		}
+		return words.length ? words : null;
+	}
+
+	function parse(lrc) {
+		const lines = [];
+		let offset = 0;
+		const meta = {};
+		for (const raw of String(lrc || '').split(/\r?\n/)) {
+			const mm = /^\[(ar|ti|al|by|length|offset):(.*)\]\s*$/i.exec(raw.trim());
+			if (mm) {
+				meta[mm[1].toLowerCase()] = mm[2].trim();
+				if (mm[1].toLowerCase() === 'offset') offset = Number(mm[2]) / 1000 || 0;
+				continue;
+			}
+			TAG.lastIndex = 0;
+			const times = [];
+			let m, end = 0;
+			while ((m = TAG.exec(raw)) && m.index === end) {
+				times.push(secs(m[1], m[2], m[3]));
+				end = TAG.lastIndex;
+			}
+			if (!times.length) continue;
+			let text = raw.slice(end).trim();
+			const words = parseWords(text);
+			if (words) text = words.map((w) => w.text).join('').trim();
+			for (const t of times) lines.push({ t: Math.max(0, t - offset), text, words: words && words.map((w) => ({ ...w, t: w.t - offset, end: w.end != null ? w.end - offset : undefined })) });
+		}
+		lines.sort((a, b) => a.t - b.t);
+		for (let i = 0; i < lines.length; ++i) lines[i].end = i + 1 < lines.length ? lines[i + 1].t : lines[i].t + 6;
+		// drop empty markers that follow each other, keep one as an "instrumental" gap
+		const out = [];
+		for (const l of lines) {
+			if (!l.text && out.length && !out[out.length - 1].text) {
+				out[out.length - 1].end = l.end;
+				continue;
+			}
+			out.push(l);
+		}
+		while (out.length && !out[out.length - 1].text) out.pop();
+		return { lines: out, meta, synced: out.length > 0 };
+	}
+
+	function plain(text) {
+		const lines = String(text || '')
+			.split(/\r?\n/)
+			.map((s) => s.trim())
+			.reduce((acc, s) => {
+				if (s || (acc.length && acc[acc.length - 1].text)) acc.push({ t: null, end: null, text: s });
+				return acc;
+			}, []);
+		while (lines.length && !lines[lines.length - 1].text) lines.pop();
+		return { lines, meta: {}, synced: false };
+	}
+
+	KCL.lrc = { parse, plain };
+})(globalThis);

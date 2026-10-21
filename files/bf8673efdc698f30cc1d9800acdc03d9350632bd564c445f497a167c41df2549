@@ -1,0 +1,466 @@
+// Offscreen document: owns the AudioContext. Captures the tab audio, runs it through the
+// key-shifter worklet (and, in high-quality mode, the separation worker) and plays the
+// processed result. Chrome mutes the captured tab, so only the processed audio is heard.
+//
+// Sound starts immediately: a light-mode path plays while the separation model loads, and
+// paths are swapped with a short crossfade once the new one is producing valid audio.
+import { StreamSeparator } from '../lib/separator.js';
+
+const SEP = { window: 64, hop: 8, lookahead: 4 };
+// headroom for inference time and scheduling jitter, sized from the measured inference time
+// on this computer (an underrun later adds 0.15 s automatically)
+const SEP_MARGIN_MIN = 0.15, SEP_MARGIN_MAX = 0.8;
+const MAX_SEP_DELAY_SECONDS = 2.5;
+const FADE = 0.06; // seconds
+
+let ctx = null;
+let stream = null;
+let source = null;
+let out = null; // master gain -> destination
+let settings = null;
+let wasmBytes = null;
+let current = null; // audible path {node, gain, mode}
+let pending = null; // path being prepared
+let workerPromise = null; // Promise<{worker, info}>, shared while capturing
+let profile = null; // cached speed measurement of the separation model on this computer
+let wanted = 'light'; // mode requested by the user
+let hqGen = 0; // generation of the separation worker's current port (matches its own counter)
+
+// ---------- lyrics analysis (singing activity + speech recognition) ----------
+// What the lyrics panel of the captured tab currently needs: 'off' | 'align' | 'live'
+let lyricsNeed = { mode: 'off', intensity: 'low', prompt: '', lang: null };
+let asrWorker = null;
+let analysis = null; // {worker, ready, gen}: separator for the lyrics in light mode
+let analysisGen = 0;
+let analysisStopTimer = null;
+const sendLyrics = (event) => chrome.runtime.sendMessage({ target: 'background', type: 'lyrics-event', event }).catch(() => {});
+
+const status = {
+	active: false,
+	mode: 'light', // mode actually audible
+	latency: 0, // seconds, total audio delay including output device
+	cpuAudio: 0, // fraction of real time used by the worklet
+	cpuAI: 0, // fraction of time the separation worker is busy
+	backend: '',
+	sepHop: 0,
+	underruns: 0,
+	notice: '',
+	error: '',
+	melody: null, // {bins, seconds}: notes sung in the current song (hq mode only)
+};
+
+async function loadWasm() {
+	if (wasmBytes) return wasmBytes;
+	wasmBytes = {};
+	for (const f of ['rubberband.wasm', 'signalsmith.wasm']) {
+		const res = await fetch(chrome.runtime.getURL('wasm/' + f));
+		wasmBytes[f] = await res.arrayBuffer();
+	}
+	return wasmBytes;
+}
+
+function setLatency(processingSeconds) {
+	status.latency = processingSeconds + (ctx.baseLatency || 0) + (ctx.outputLatency || 0);
+	chrome.runtime.sendMessage({ target: 'background', type: 'latency', seconds: status.latency }).catch(() => {});
+}
+
+async function start(streamId, s, cachedProfile) {
+	settings = s;
+	profile = cachedProfile || null;
+	stream = await navigator.mediaDevices.getUserMedia({
+		audio: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: streamId } },
+		video: false,
+	});
+	stream.getAudioTracks()[0].addEventListener('ended', () => {
+		chrome.runtime.sendMessage({ target: 'background', type: 'ended' }).catch(() => {});
+	});
+	// one context for both modes so paths can be swapped seamlessly
+	ctx = new AudioContext({ latencyHint: 'balanced' });
+	await Promise.all([ctx.audioWorklet.addModule(chrome.runtime.getURL('worklet/key-shifter.js')), loadWasm()]);
+	source = ctx.createMediaStreamSource(stream);
+	out = ctx.createGain();
+	out.connect(ctx.destination);
+	status.active = true;
+	await setMode(settings.mode);
+}
+
+// ---------- separation worker (kept alive while capturing) ----------
+function ensureWorker() {
+	if (workerPromise) return workerPromise;
+	workerPromise = new Promise((resolve, reject) => {
+		const w = new Worker(chrome.runtime.getURL('offscreen/separation-worker.js'), { type: 'module' });
+		const timer = setTimeout(() => reject(new Error('separation model timed out')), 60000);
+		w.onmessage = (e) => {
+			const m = e.data;
+			if (m.type === 'ready') {
+				clearTimeout(timer);
+				w.onmessage = onWorkerMessage;
+				profile = { backend: m.backend, f16: !!m.f16, inferMs: m.inferMs, worstMs: m.worstMs, hop: m.hop };
+				chrome.runtime.sendMessage({ target: 'background', type: 'sep-profile', profile }).catch(() => {});
+				resolve({ worker: w, info: m });
+			} else if (m.type === 'error') {
+				clearTimeout(timer);
+				w.terminate();
+				reject(new Error(m.error));
+			}
+		};
+		w.onerror = (e) => {
+			clearTimeout(timer);
+			reject(new Error(e.message || 'separation worker failed'));
+		};
+		w.postMessage({ type: 'init', base: chrome.runtime.getURL(''), sampleRate: ctx.sampleRate, profile, ...SEP });
+	});
+	workerPromise.catch(() => { workerPromise = null; });
+	return workerPromise;
+}
+
+function onWorkerMessage(e) {
+	const m = e.data;
+	if (m.type === 'vad' || m.type === 'asr-audio') {
+		const path = [current, pending].find((p) => p && p.mode === 'hq' && p.gen === m.gen);
+		if (path && path === current) onAnalysis(m, path);
+	} else if (m.type === 'stats') {
+		status.cpuAI = m.load;
+		if (m.melody) status.melody = m.melody;
+	} else if (m.type === 'error') {
+		fallback('fallbackError');
+	}
+}
+
+function stopWorker() {
+	if (!workerPromise) return;
+	workerPromise.then(({ worker }) => worker.terminate(), () => {});
+	workerPromise = null;
+}
+
+// ---------- processing paths ----------
+function makePath(mode, sepDelay = 0) {
+	const bytes = {};
+	for (const [k, v] of Object.entries(wasmBytes)) bytes[k] = v.slice(0);
+	const node = new AudioWorkletNode(ctx, 'key-shifter', {
+		numberOfInputs: 1,
+		numberOfOutputs: 1,
+		outputChannelCount: [2],
+		processorOptions: {
+			mode,
+			engine: settings.engine,
+			modules: bytes,
+			params: params(),
+			sepDelay,
+			maxSepDelay: Math.round(MAX_SEP_DELAY_SECONDS * ctx.sampleRate),
+		},
+	});
+	const gain = ctx.createGain();
+	gain.gain.value = 0;
+	source.connect(node);
+	node.connect(gain).connect(out);
+	const path = { node, gain, mode, primed: null, latency: 0 };
+	path.primed = new Promise((resolve) => { path.onPrimed = resolve; });
+	node.port.onmessage = (e) => {
+		const m = e.data;
+		if (m.type === 'stats') noteEpoch(path, m.inPos);
+		if (m.type === 'primed') {
+			path.onPrimed();
+		} else if (m.type === 'latency') {
+			path.latency = m.seconds;
+			if (path === current) setLatency(m.seconds);
+		} else if (path !== current) {
+			// not audible yet
+		} else if (m.type === 'applied') {
+			status.semitones = m.semitones;
+		} else if (m.type === 'stats') {
+			status.cpuAudio = m.cpu;
+			status.underruns = m.underruns;
+			status.semitones = m.semitones;
+			noteEpoch(path, m.inPos);
+		} else if (m.type === 'fallback') {
+			fallback('fallbackUnderrun');
+		}
+	};
+	return path;
+}
+
+function dropPath(path) {
+	if (!path) return;
+	try { source.disconnect(path.node); } catch (e) { /* already */ }
+	path.node.port.postMessage({ type: 'close' });
+	path.node.port.onmessage = null;
+	setTimeout(() => { path.node.disconnect(); path.gain.disconnect(); }, FADE * 2000);
+}
+
+// crossfade from the current path to `next` once it produces valid audio
+async function swapTo(next) {
+	await next.primed;
+	if (pending !== next) return false;
+	const t = ctx.currentTime;
+	next.gain.gain.setValueAtTime(0, t);
+	next.gain.gain.linearRampToValueAtTime(1, t + FADE);
+	if (current) {
+		current.gain.gain.setValueAtTime(current.gain.gain.value, t);
+		current.gain.gain.linearRampToValueAtTime(0, t + FADE);
+		dropPath(current);
+	}
+	current = next;
+	pending = null;
+	status.mode = next.mode;
+	updateAnalysis();
+	status.underruns = 0;
+	if (next.latency) setLatency(next.latency);
+	return true;
+}
+
+async function setMode(mode) {
+	wanted = mode;
+	if (pending) { dropPath(pending); pending = null; }
+	status.error = '';
+	if (mode === 'light') {
+		status.notice = '';
+		status.cpuAI = 0;
+		if (current && current.mode === 'light' && current.engine === settings.engine) return;
+		const p = makePath('light');
+		p.engine = settings.engine;
+		pending = p;
+		await swapTo(p);
+		stopWorkerLater();
+		return;
+	}
+	// hq: keep (or start) light audio while the model loads
+	if (!current) {
+		const p = makePath('light');
+		p.engine = settings.engine;
+		pending = p;
+		await swapTo(p);
+	}
+	status.notice = 'preparing';
+	let w;
+	try {
+		w = await ensureWorker();
+	} catch (err) {
+		if (wanted !== 'hq') return;
+		status.notice = 'hqUnavailable';
+		status.noticeDetail = err.message;
+		updateAnalysis();
+		return;
+	}
+	if (wanted !== 'hq') return;
+	const { worker, info } = w;
+	status.backend = info.backend;
+	status.sepHop = info.hop;
+	const margin = Math.min(SEP_MARGIN_MAX, Math.max(SEP_MARGIN_MIN, (1.6 * (info.worstMs || info.inferMs) + 100) / 1000));
+	const sepDelay = StreamSeparator.algorithmicLatency(info.hop, SEP.lookahead) + Math.round(margin * ctx.sampleRate);
+	const p = makePath('hq', sepDelay);
+	pending = p;
+	const ch = new MessageChannel();
+	p.gen = ++hqGen;
+	worker.postMessage({ type: 'port', port: ch.port1 }, [ch.port1]);
+	worker.postMessage({ type: 'asr', on: lyricsNeed.mode !== 'off' });
+	p.node.port.postMessage({ type: 'port', port: ch.port2 }, [ch.port2]);
+	if (await swapTo(p)) status.notice = '';
+}
+
+// the model stays loaded for a while after leaving hq mode, so switching back is instant
+let stopTimer = null;
+function stopWorkerLater() {
+	clearTimeout(stopTimer);
+	stopTimer = setTimeout(() => { if (wanted !== 'hq') stopWorker(); }, 120000);
+}
+
+async function fallback(code) {
+	if (status.mode !== 'hq') return;
+	await setMode('light');
+	wanted = 'light';
+	status.notice = code;
+}
+
+// wall-clock time (ms) of a path's input sample 0. Stats messages arrive a little after they
+// are sent, so the earliest estimate is the best one.
+function noteEpoch(path, inPos) {
+	if (!path || inPos == null || !ctx) return;
+	const e = Date.now() - (inPos / ctx.sampleRate) * 1000;
+	if (path.epoch == null || e < path.epoch) path.epoch = e;
+}
+const wallOf = (path, sample) => path.epoch + (sample / ctx.sampleRate) * 1000;
+
+// singing activity / vocals from a separator, for the current path
+function onAnalysis(m, path) {
+	if (path.epoch == null) return;
+	if (m.type === 'vad') {
+		sendLyrics({ type: 'lyrics-signal', vad: { wall0: wallOf(path, m.start), binSec: m.binSamples / ctx.sampleRate, bins: m.bins } });
+	} else if (m.type === 'asr-audio' && asrWorker) {
+		asrWorker.postMessage({ type: 'audio', wall: wallOf(path, m.start), pcm: m.pcm }, [m.pcm.buffer]);
+	}
+}
+
+function ensureAsr() {
+	if (asrWorker) return asrWorker;
+	asrWorker = new Worker(chrome.runtime.getURL('offscreen/asr-worker.js'), { type: 'module' });
+	const asrStart = Date.now();
+	asrWorker.postMessage({ type: 'init', base: chrome.runtime.getURL('') });
+	asrWorker.onmessage = (e) => {
+		const m = e.data;
+		if (m.type === 'segments') sendLyrics({ type: 'lyrics-signal', asr: { segs: m.segs, lang: m.lang, window: m.window } });
+		else if (m.type === 'stats') status.cpuASR = m.load;
+		else if (m.type === 'run') (status.asrRuns = (status.asrRuns || []).concat({ ...m, at: Date.now() })).splice(0, Math.max(0, status.asrRuns.length - 30));
+		else if (m.type === 'ready') {
+			status.asrLoadMs = Date.now() - asrStart;
+			sendLyrics({ type: 'lyrics-listening', on: true });
+		}
+		else if (m.type === 'error') status.asrError = m.error;
+	};
+	return asrWorker;
+}
+
+// light mode has no separated vocals: while the lyrics need them, a separator runs on a copy
+// of the input just for the analysis (every 32 frames: a quarter of the work, latency does
+// not matter here)
+async function startAnalysis() {
+	clearTimeout(analysisStopTimer);
+	if (!analysis) {
+		const w = new Worker(chrome.runtime.getURL('offscreen/separation-worker.js'), { type: 'module' });
+		analysis = { worker: w, ready: null, gen: 0, path: null };
+		analysis.ready = new Promise((resolve, reject) => {
+			w.onmessage = (e) => {
+				const m = e.data;
+				if (m.type === 'ready') resolve();
+				else if (m.type === 'error') reject(new Error(m.error));
+				else if ((m.type === 'vad' || m.type === 'asr-audio') && analysis && m.gen === analysis.gen && analysis.path === current) onAnalysis(m, current);
+			};
+		});
+		w.postMessage({ type: 'init', base: chrome.runtime.getURL(''), sampleRate: ctx.sampleRate, profile: profile && profile.backend ? { ...profile } : null, window: SEP.window, hop: 32, lookahead: SEP.lookahead, analysisOnly: true });
+		analysis.ready.catch(() => stopAnalysis());
+	}
+	await analysis.ready;
+	if (!analysis || !current || current.mode !== 'light' || analysis.path === current) return;
+	const ch = new MessageChannel();
+	analysis.gen++;
+	analysis.path = current;
+	analysis.worker.postMessage({ type: 'port', port: ch.port1 }, [ch.port1]);
+	analysis.worker.postMessage({ type: 'asr', on: lyricsNeed.mode !== 'off' });
+	current.node.port.postMessage({ type: 'tap', port: ch.port2 }, [ch.port2]);
+}
+
+function stopAnalysis() {
+	if (!analysis) return;
+	if (analysis.path) analysis.path.node.port.postMessage({ type: 'tap', port: null });
+	analysis.worker.terminate();
+	analysis = null;
+}
+
+// start / stop the analysis to match what the lyrics need and which path is playing
+function updateAnalysis() {
+	if (!ctx || !current) return;
+	// while the high-quality model is being prepared (it measures its own speed), wait
+	const preparingHq = wanted === 'hq' && current.mode !== 'hq' && status.notice === 'preparing';
+	const need = lyricsNeed.mode !== 'off' && !preparingHq;
+	if (need) ensureAsr().postMessage({ type: 'config', ...lyricsNeed });
+	else if (asrWorker) asrWorker.postMessage({ type: 'config', mode: 'off' });
+	if (workerPromise) workerPromise.then(({ worker }) => worker.postMessage({ type: 'asr', on: need }), () => {});
+	if (current.mode === 'light' && need) startAnalysis().catch(() => {});
+	else if (analysis) {
+		clearTimeout(analysisStopTimer);
+		// in hq mode the main separator provides the vocals; keep the analysis a moment in case
+		// the user switches back
+		if (current.mode === 'hq' && analysis.path) { analysis.path.node.port.postMessage({ type: 'tap', port: null }); analysis.path = null; }
+		analysisStopTimer = setTimeout(stopAnalysis, need ? 60000 : 20000);
+	}
+}
+
+function params() {
+	return { semitones: settings.semitones, formant: settings.formant, bypass: settings.bypass, vocalGain: settings.vocalGain };
+}
+
+async function update(s) {
+	const old = settings;
+	settings = s;
+	for (const p of [current, pending]) if (p) p.node.port.postMessage({ type: 'params', ...params() });
+	if (s.mode !== old.mode || (s.mode === 'light' && s.engine !== old.engine)) await setMode(s.mode);
+}
+
+// Records what is being played (processed output) for `seconds`, optionally together with the
+// unprocessed tab audio over the same time span; returns base64 WebM/Opus.
+// Used by the automated browser tests.
+async function record(seconds, withOriginal = false) {
+	const dest = ctx.createMediaStreamDestination();
+	out.connect(dest);
+	const recorders = [dest.stream, ...(withOriginal ? [stream] : [])].map((st) => {
+		const rec = new MediaRecorder(st, { mimeType: 'audio/webm;codecs=opus', audioBitsPerSecond: 256000 });
+		const parts = [];
+		rec.ondataavailable = (e) => parts.push(e.data);
+		const done = new Promise((resolve) => { rec.onstop = resolve; });
+		return { rec, parts, done };
+	});
+	recorders.forEach((r) => r.rec.start());
+	await new Promise((r) => setTimeout(r, seconds * 1000));
+	recorders.forEach((r) => r.rec.stop());
+	await Promise.all(recorders.map((r) => r.done));
+	out.disconnect(dest);
+	const encode = async (parts) => {
+		const buf = new Uint8Array(await new Blob(parts).arrayBuffer());
+		let bin = '';
+		for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode(...buf.subarray(i, i + 0x8000));
+		return btoa(bin);
+	};
+	return { data: await encode(recorders[0].parts), original: withOriginal ? await encode(recorders[1].parts) : null };
+}
+
+async function stop() {
+	clearTimeout(stopTimer);
+	stopWorker();
+	stopAnalysis();
+	if (asrWorker) asrWorker.terminate();
+	asrWorker = null;
+	if (stream) stream.getTracks().forEach((t) => t.stop());
+	if (ctx) await ctx.close();
+	ctx = stream = source = out = current = pending = null;
+	status.active = false;
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+	if (msg.target !== 'offscreen') return false;
+	(async () => {
+		switch (msg.type) {
+			case 'start':
+				// returns as soon as sound is playing; hq preparation continues in the background
+				await new Promise((resolve, reject) => {
+					const wait = setInterval(() => {
+						if (current) { clearInterval(wait); resolve(); }
+					}, 20);
+					start(msg.streamId, msg.settings, msg.profile).catch((e) => { clearInterval(wait); reject(e); });
+				});
+				return { ok: true };
+			case 'settings':
+				update(msg.settings);
+				return { ok: true };
+			case 'stop':
+				await stop();
+				return { ok: true };
+			case 'mute':
+				if (out) out.gain.setTargetAtTime(msg.muted ? 0 : 1, ctx.currentTime, 0.02);
+				return { ok: true };
+			case 'lyrics-need':
+				lyricsNeed = { mode: msg.mode || 'off', intensity: msg.intensity || 'low', prompt: msg.prompt || '', lang: msg.lang || null };
+				updateAnalysis();
+				return { ok: true, analysing: lyricsNeed.mode !== 'off' };
+			case 'lyrics-reset':
+				if (asrWorker) asrWorker.postMessage({ type: 'reset' });
+				return { ok: true };
+			case 'new-song':
+				if (asrWorker) asrWorker.postMessage({ type: 'reset' });
+				// the page moved to another song: start the range measurement over
+				status.melody = null;
+				if (workerPromise) workerPromise.then(({ worker }) => worker.postMessage({ type: 'reset-melody' }), () => {});
+				return { ok: true };
+			case 'status':
+				return { ok: true, status: { ...status, sampleRate: ctx ? ctx.sampleRate : 0 } };
+			case 'record':
+				return { ok: true, ...(await record(msg.seconds, msg.withOriginal)) };
+		}
+	})().then(
+		(r) => sendResponse(r),
+		(e) => {
+			status.error = String(e && e.message || e);
+			sendResponse({ ok: false, error: status.error });
+		},
+	);
+	return true;
+});

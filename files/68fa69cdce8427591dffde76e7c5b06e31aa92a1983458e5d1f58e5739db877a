@@ -1,0 +1,152 @@
+// Voice range registration: measures the notes the user can hold steadily (mic, YIN) or lets
+// them pick the notes by hand, and stores {low, high} as MIDI note numbers.
+import { yin, hzToMidi, karaoke, scientific, ALL_NOTES } from '../lib/notes.js';
+import { loadVoice } from '../lib/settings.js';
+import { t, localize, isJapanese } from '../lib/i18n.js';
+
+const noteName = (m) => (isJapanese() ? karaoke(m) : scientific(m));
+
+const $ = (id) => document.getElementById(id);
+const RULER_LO = 38; // D2
+const RULER_HI = 84; // C6
+let range = { low: null, high: null };
+let ctx = null, stream = null, analyser = null, raf = 0;
+
+const pos = (m) => ((Math.min(RULER_HI, Math.max(RULER_LO, m)) - RULER_LO) / (RULER_HI - RULER_LO)) * 100;
+
+function fillSelect(sel) {
+	for (const m of ALL_NOTES) {
+		const o = document.createElement('option');
+		o.value = m;
+		o.textContent = isJapanese() ? `${karaoke(m)}（${scientific(m)}）` : scientific(m);
+		sel.append(o);
+	}
+}
+
+function render() {
+	const { low, high } = range;
+	if (low != null) $('low').value = low;
+	if (high != null) $('high').value = high;
+	const r = $('rulerRange');
+	if (low != null && high != null) {
+		r.style.left = pos(low) + '%';
+		r.style.width = pos(high) - pos(low) + '%';
+	} else {
+		r.style.width = '0';
+	}
+}
+
+function labels() {
+	const box = $('rulerLabels');
+	for (const m of [40, 48, 57, 60, 69, 72, 81]) {
+		const s = document.createElement('span');
+		s.style.left = pos(m) + '%';
+		s.textContent = noteName(m);
+		box.append(s);
+	}
+}
+
+// a note counts once it has been held (within ±0.5 semitone) for this long
+const HOLD_SECONDS = 0.7;
+let held = { note: null, since: 0 };
+
+function onPitch(midi, now) {
+	const marker = $('rulerMarker');
+	if (midi == null) {
+		$('noteBig').classList.remove('stable');
+		marker.classList.remove('show');
+		held.note = null;
+		return;
+	}
+	const n = Math.round(midi);
+	$('noteBig').textContent = noteName(n);
+	$('noteSub').textContent = `${isJapanese() ? scientific(n) + ' · ' : ''}${Math.round(440 * Math.pow(2, (midi - 69) / 12))} Hz`;
+	marker.style.left = pos(midi) + '%';
+	marker.classList.add('show');
+	if (held.note == null || Math.abs(midi - held.note) > 0.5) {
+		held = { note: midi, since: now };
+		$('noteBig').classList.remove('stable');
+		return;
+	}
+	if (now - held.since >= HOLD_SECONDS) {
+		$('noteBig').classList.add('stable');
+		if (range.low == null || n < range.low) range.low = n;
+		if (range.high == null || n > range.high) range.high = n;
+		render();
+	}
+}
+
+async function startMic() {
+	stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true } });
+	ctx = new AudioContext();
+	analyser = ctx.createAnalyser();
+	analyser.fftSize = 4096;
+	ctx.createMediaStreamSource(stream).connect(analyser);
+	const buf = new Float32Array(analyser.fftSize);
+	const step = Math.max(1, Math.round(ctx.sampleRate / 16000));
+	const fs = ctx.sampleRate / step;
+	const small = new Float32Array(Math.floor(buf.length / step));
+	const loop = () => {
+		analyser.getFloatTimeDomainData(buf);
+		for (let i = 0; i < small.length; ++i) {
+			let s = 0;
+			for (let k = 0; k < step; ++k) s += buf[i * step + k];
+			small[i] = s / step;
+		}
+		const r = yin(small.subarray(small.length - 1024), fs, 60, 1200, 0.15);
+		onPitch(r && r.confidence > 0.8 ? hzToMidi(r.hz) : null, performance.now() / 1000);
+		raf = requestAnimationFrame(loop);
+	};
+	loop();
+	$('mic').classList.add('recording');
+	$('micLabel').textContent = t('micStop');
+}
+
+function stopMic() {
+	cancelAnimationFrame(raf);
+	if (stream) stream.getTracks().forEach((t) => t.stop());
+	if (ctx) ctx.close();
+	ctx = stream = analyser = null;
+	$('mic').classList.remove('recording');
+	$('micLabel').textContent = t('micStart');
+	onPitch(null, 0);
+}
+
+async function init() {
+	localize();
+	fillSelect($('low'));
+	fillSelect($('high'));
+	labels();
+	const saved = await loadVoice();
+	range = saved ? { low: saved.low, high: saved.high } : { low: 48, high: 67 };
+	render();
+	if (!saved) $('noteSub').textContent = t('rangeNotSet');
+
+	$('mic').addEventListener('click', async () => {
+		if (stream) return stopMic();
+		try {
+			await startMic();
+		} catch (e) {
+			$('noteSub').textContent = t('micError', e.message || e);
+		}
+	});
+	$('reset').addEventListener('click', () => {
+		range = { low: null, high: null };
+		render();
+		$('noteBig').textContent = '–';
+	});
+	$('low').addEventListener('change', (e) => { range.low = Number(e.target.value); if (range.high != null && range.high < range.low) range.high = range.low; render(); });
+	$('high').addEventListener('change', (e) => { range.high = Number(e.target.value); if (range.low != null && range.low > range.high) range.low = range.high; render(); });
+	$('save').addEventListener('click', async () => {
+		if (range.low == null || range.high == null) {
+			$('saved').textContent = t('pickBoth');
+		} else {
+			await chrome.storage.local.set({ voice: { low: range.low, high: range.high, savedAt: Date.now() } });
+			$('saved').textContent = t('savedMsg', `${noteName(range.low)} – ${noteName(range.high)}`);
+		}
+		$('saved').classList.add('show');
+		setTimeout(() => $('saved').classList.remove('show'), 3500);
+	});
+}
+
+init();

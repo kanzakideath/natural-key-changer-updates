@@ -1,0 +1,343 @@
+// Where in the lyrics is the singer now? A position tracker for any version of a song.
+//
+// The lyrics give the times lines start in one recording. What plays may be another version:
+// a cover in another tempo (0.8x .. 1.25x), one that starts with the last chorus, a TV size
+// that starts at the chorus, a verse cut, a solo inserted, a longer intro, a chorus sung once
+// more at the end. So the state is the position in the lyrics itself (0.1 s steps), not an
+// offset from the recording:
+//
+//   - every 2 s of audio the position moves on at the song's tempo (one Viterbi per tempo;
+//     the best one wins), drifting by 0.1 s for a little cost, or jumps anywhere for a larger
+//     one (a cut, a repeat, a different structure)
+//   - evidence: the singing activity of the separated vocals against the singing the lyrics
+//     expect (correlation over 8 s), and above all the recognised words (each phrase heard
+//     marks every place in the lyrics it matches: a chorus marks all its repeats, and the
+//     continuity of the path picks the right one)
+//   - "no change" (offset 0, tempo 1) is favoured, so an official recording stays as it is
+//
+// Interface (as the earlier KCL.Follower): add(), addAnchor(), solve(), time(), map, solved.
+(function (root) {
+	const KCL = (root.KCL = root.KCL || {});
+	const G = KCL.ALIGN_BIN; // 0.1 s
+	const STEP = 20; // bins (2 s)
+	const WIN = 80; // bins (8 s)
+	const PRE = 60; // s of lyrics position before 0 (intros longer than the recording's)
+	const NEG = -1e9;
+
+	class Tracker {
+		constructor(lines, opts = {}) {
+			this.lines = lines.filter((l) => l.t != null && l.text);
+			this.opts = {
+				tempos: [1, 0.95, 1.05, 0.9, 1.1, 0.85, 1.15, 0.8, 1.2, 1.25],
+				jump: 14, drift: 0.8, prior: 12, gain: 2, asrGain: 5, tempoCost: 1.2, tempoStep: 0.05, minMargin: 0, confirm: true, hold: 0, hintTol: 30, window: 60, tempoKeep: 6, minVoiced: 3, hints: [],
+				...opts,
+			};
+			// a version announced as rapped / rearranged / sped up may be much faster (or slower):
+			// tempos up to 1.9x, each one cheaper to keep (measured: 1.5x 6% -> 64% of the time
+			// on the right line, no loss elsewhere; not for every video: noisy audio picks a wrong
+			// fast tempo more often)
+			if (opts.wide && !opts.tempos) {
+				this.opts.tempos = [1, 0.95, 1.05, 0.9, 1.1, 0.85, 1.15, 0.8, 1.2, 1.25, 1.35, 1.5, 1.7, 1.9, 0.7];
+				if (opts.tempoStep == null) this.opts.tempoStep = 0.02;
+			}
+			this.opts.sameLength = !!opts.sameLength;
+			if (this.opts.sameLength) this.opts.minMargin = Math.max(this.opts.minMargin, 30);
+			const L = this.lines;
+			const endL = L.length ? L[L.length - 1].t + 15 : 30;
+			this.lmin = -PRE;
+			this.ns = Math.ceil((endL - this.lmin) / G) + 1; // positions
+			// expected singing, -1 / +1, with a margin on both sides for the window reads
+			this.pad = WIN * 2;
+			const E = new Int8Array(this.ns + 2 * this.pad).fill(-1);
+			for (let i = 0; i < L.length; ++i) {
+				const l = L[i];
+				const next = i + 1 < L.length ? L[i + 1].t : l.t + 10;
+				const dur = Math.min(Math.max(KCL.singDuration(l.text) * 1.6, 2.5), 9, Math.max(0.5, next - l.t - 0.25));
+				const a = Math.round((l.t - this.lmin) / G) + this.pad, b = Math.round((l.t + dur - this.lmin) / G) + this.pad;
+				for (let k = Math.max(0, a); k < Math.min(E.length, b); ++k) E[k] = 1;
+			}
+			this.E = E;
+			this.segs = []; // contiguous media: {k0, v[]}
+			this.anchorsExt = [];
+			this.cache = new Map();
+			this.map = new KCL.TimeMap();
+			this.solved = null;
+			this.holding = null;
+			const self = this;
+			// what the panel / debug read from the older follower
+			this.al = {
+				get voicedSeconds() { let s = 0; for (const seg of self.segs) for (const x of seg.v) s += x * G; return s; },
+				get anchorsExt() { return self.anchorsExt; },
+			};
+		}
+
+		add(m0, values) {
+			let seg = this.segs[this.segs.length - 1];
+			const k0 = Math.round(m0 / G);
+			if (!seg || Math.abs(k0 - (seg.k0 + seg.v.length)) > 2) {
+				seg = { k0, v: [] };
+				this.segs.push(seg);
+			}
+			const at = k0 - seg.k0;
+			for (let i = 0; i < values.length; ++i) seg.v[at + i] = values[i];
+			for (let i = 0; i < seg.v.length; ++i) if (seg.v[i] == null) seg.v[i] = 0;
+		}
+
+		addAnchor(m, l, w = 1) {
+			if (this.anchorsExt.length < 600) this.anchorsExt.push({ m, l, w });
+		}
+
+		// position index <-> lyrics time
+		idx(l) { return Math.round((l - this.lmin) / G); }
+		pos(j) { return this.lmin + j * G; }
+
+		// activity agreement for every position at one step and tempo (cached: past windows
+		// never change). Stored as int8 (correlation x 100).
+		emission(seg, c, ti) {
+			const r = this.opts.tempos[ti];
+			const key = seg.k0 * 64 + ti + ':' + c;
+			const len = seg.v.length;
+			const b = Math.min(len, c + WIN / 2);
+			const hit = this.cache.get(key);
+			if (hit && hit.b === b) return hit.sc;
+			const a = Math.max(0, c - WIN / 2);
+			const n = b - a;
+			const ns = this.ns;
+			const sc = new Int8Array(ns);
+			let so = 0, soo = 0;
+			const O = new Float32Array(n);
+			for (let i = a; i < b; ++i) { const x = Math.min(1, seg.v[i] * 1.6); O[i - a] = x; so += x; soo += x * x; }
+			const mo = so / n, vo = soo / n - mo * mo;
+			if (vo > 0.02 && n >= 20) {
+				const sdo = Math.sqrt(vo);
+				// media bin a+i, seen from the window centre c at position j: lyrics bin j + d[i]
+				const d = new Int32Array(n);
+				for (let i = 0; i < n; ++i) d[i] = Math.round((a + i - c) * r) + this.pad;
+				const E = this.E;
+				for (let j = 0; j < ns; ++j) {
+					let se = 0, soe = 0;
+					for (let i = 0; i < n; ++i) if (E[j + d[i]] > 0) { se++; soe += O[i]; }
+					const me = se / n, ve = me - me * me;
+					if (ve > 0.01) sc[j] = Math.max(-127, Math.min(127, Math.round((100 * (soe / n - mo * me)) / (sdo * Math.sqrt(ve)))));
+				}
+			}
+			this.cache.set(key, { b, sc });
+			return sc;
+		}
+
+		steps() {
+			const out = [];
+			for (const seg of this.segs) {
+				const len = seg.v.length;
+				if (len < 30) continue;
+				const first = Math.min(WIN / 2, len);
+				for (let c = first; c <= len; c += STEP) out.push({ seg, c, m: (seg.k0 + c) * G, newSeg: c === first });
+			}
+			return out;
+		}
+
+		// forward pass at one tempo; with `keep`, back pointers for the path
+		pass(ti, steps, keep) {
+			const o = this.opts;
+			const r = o.tempos[ti];
+			const ns = this.ns;
+			const gain = o.gain / 100;
+			// recognised words: bonus at each step, around the position they put the singer at
+			const bonus = new Map(); // step -> [[j, v]]
+			for (const an of this.anchorsExt) {
+				let t = -1;
+				for (let k = 0; k < steps.length; ++k) if (t < 0 || Math.abs(steps[k].m - an.m) < Math.abs(steps[t].m - an.m)) t = k;
+				if (t < 0 || Math.abs(steps[t].m - an.m) > 2.5) continue;
+				const j = this.idx(an.l + r * (steps[t].m - an.m));
+				const list = bonus.get(t) || [];
+				for (let dj = -4; dj <= 4; ++dj) list.push([j + dj, an.w * o.gain * o.asrGain * (1 - Math.abs(dj) / 5)]);
+				bonus.set(t, list);
+			}
+			let V = new Float32Array(ns);
+			const back = keep ? [] : null;
+			// start: where the recording would be (offset 0, or a hinted one), anything else costs
+			const s0 = steps[0];
+			const j0 = this.idx(s0.m * r);
+			const hinted = o.hints.map((h) => this.idx(s0.m * r + h * r));
+			const em0 = this.emission(s0.seg, s0.c, ti);
+			// a window of the latest steps only (long videos): it starts where the path was
+			const from = steps.from != null ? this.idx(steps.from) : null;
+			for (let j = 0; j < ns; ++j) {
+				let p;
+				if (from != null) p = Math.abs(j - from) <= 5 ? 0 : o.prior;
+				else {
+					p = Math.abs(j - j0) <= 2 ? 0 : o.prior;
+					// (the length difference is a rough hint: an outro may differ too)
+					for (const h of hinted) if (Math.abs(j - h) <= o.hintTol) p = Math.min(p, o.prior * (0.1 + 0.4 * (Math.abs(j - h) / o.hintTol)));
+				}
+				V[j] = em0[j] * gain - p;
+			}
+			for (const [j, v] of bonus.get(0) || []) if (j >= 0 && j < ns) V[j] += v;
+			let stay = em0[Math.max(0, Math.min(ns - 1, j0))] * gain;
+			for (let t = 1; t < steps.length; ++t) {
+				const st = steps[t];
+				const shift = Math.round((r * (st.m - steps[t - 1].m)) / G);
+				const jp = st.newSeg ? o.jump * 0.3 : o.jump;
+				let bj = 0;
+				for (let j = 1; j < ns; ++j) if (V[j] > V[bj]) bj = j;
+				const vj = V[bj] - jp;
+				const em = this.emission(st.seg, st.c, ti);
+				const W = new Float32Array(ns);
+				const bk = keep ? new Int16Array(ns) : null;
+				for (let j = 0; j < ns; ++j) {
+					// from j - shift (before the first position: still in the intro)
+					const s = Math.max(0, Math.min(ns - 1, j - shift));
+					let v = V[s], from = s;
+					if (s > 0 && V[s - 1] - o.drift > v) { v = V[s - 1] - o.drift; from = s - 1; }
+					if (s + 1 < ns && V[s + 1] - o.drift > v) { v = V[s + 1] - o.drift; from = s + 1; }
+					// the singer waits (an instrumental part that the recording does not have)
+					if (o.hold && V[j] - o.hold > v) { v = V[j] - o.hold; from = j; }
+					if (vj > v) { v = vj; from = bj; }
+					W[j] = v + em[j] * gain;
+					if (bk) bk[j] = from;
+				}
+				for (const [j, v] of bonus.get(t) || []) if (j >= 0 && j < ns) W[j] += v;
+				if (back) back.push(bk);
+				V = W;
+				// "the lyrics are right as they are": offset 0 at tempo 1
+				if (r === 1) {
+					const jz = Math.max(0, Math.min(ns - 1, this.idx(st.m)));
+					stay += em[jz] * gain;
+					for (const [j, v] of bonus.get(t) || []) if (j === jz) stay += v;
+				}
+			}
+			let end = 0;
+			for (let j = 1; j < ns; ++j) if (V[j] > V[end]) end = j;
+			return { ti, r, score: V[end], end, back, stay };
+		}
+
+		// The work in slices (one tempo at a time): solveAsync() lets the page breathe between
+		// them; solve() does it all at once.
+		solve() {
+			const it = this.work();
+			let r;
+			while (!(r = it.next()).done);
+			return r.value;
+		}
+
+		solveAsync() {
+			if (this.busy) return this.busy;
+			const it = this.work();
+			const p = new Promise((resolve) => {
+				const step = () => {
+					const t0 = performance.now();
+					let r;
+					try {
+						// a few milliseconds per slice
+						while (!(r = it.next()).done) if (performance.now() - t0 > 6) return setTimeout(step, 0);
+					} catch (e) {
+						r = { value: false };
+					}
+					if (this.busy === p) this.busy = null;
+					resolve(r.value);
+				};
+				// (started after `busy` is set: a quick solve must not leave it set)
+				setTimeout(step, 0);
+			});
+			this.busy = p;
+			return p;
+		}
+
+		*work() {
+			const o = this.opts;
+			if (this.al.voicedSeconds < o.minVoiced && !this.anchorsExt.length) return false;
+			let steps = this.steps();
+			if (!steps.length) return false;
+			// long videos: the latest ~90 s, from where the path was (the work stays the same
+			// however long the video gets)
+			let keepBefore = null;
+			if (steps.length > o.window && this.map.a.length) {
+				steps = steps.slice(-o.window);
+				steps.from = this.map.toLyrics(steps[0].m);
+				keepBefore = steps[0].m;
+				// windows that left: their scores are not needed any more
+				if (this.cache.size > o.tempos.length * o.window * 2) {
+					const live = new Set();
+					for (const st of steps) for (let ti = 0; ti < o.tempos.length; ++ti) live.add(st.seg.k0 * 64 + ti + ':' + st.c);
+					for (const k of [...this.cache.keys()]) if (!live.has(k)) this.cache.delete(k);
+				}
+			}
+			let best = null, stay = 0;
+			// all tempos now and then (and when new words came); otherwise the current one and its
+			// neighbours only (a tempo, once found, stays): a third of the work
+			this.nSolve = (this.nSolve || 0) + 1;
+			const all = this.bestTi == null || this.nSolve % 4 === 1 || this.anchorsExt.length !== this.anchorsSeen;
+			this.anchorsSeen = this.anchorsExt.length;
+			const T = o.tempos;
+			const near = (ti) => Math.abs(T[ti] - T[this.bestTi]) <= 0.051 || T[ti] === 1;
+			for (let ti = 0; ti < T.length; ++ti) {
+				if (!all && !near(ti)) continue;
+				const p = this.pass(ti, steps, false);
+				yield;
+				if (p.r === 1) stay = p.stay;
+				// another tempo has to keep earning its place: a cost per step, not only once
+				p.total = p.score - Math.round(Math.abs(p.r - 1) * 20) * (o.tempoCost + o.tempoStep * steps.length);
+				// (a window remembers the tempo found before it)
+				if (steps.from != null && this.bestTi != null && ti !== this.bestTi) p.total -= o.tempoKeep;
+				if (!best || p.total > best.total) best = p;
+			}
+			this.bestTi = best.ti;
+			const full = this.pass(best.ti, steps, true);
+			yield;
+			// the path, back from the best end
+			const path = new Int32Array(steps.length);
+			path[steps.length - 1] = full.end;
+			for (let t = steps.length - 1; t > 0; --t) path[t - 1] = full.back[t - 1][path[t]];
+			const pts = steps.map((s, t) => ({ m: s.m, l: this.pos(path[t]) }));
+			const r = full.r;
+			// a jump at the very last step only, that no recognised phrase backs: wait for the next
+			// step to confirm it (the newest window is the least certain)
+			const n = pts.length;
+			if (n >= 2 && o.confirm) {
+				const p = pts[n - 1], q = pts[n - 2];
+				const cont = q.l + r * (p.m - q.m);
+				const backed = this.anchorsExt.some((an) => Math.abs(an.m - p.m) < 4 && Math.abs(an.l - (p.l + r * (an.m - p.m))) < 1);
+				if (Math.abs(p.l - cont) > 1 && !backed) pts[n - 1] = { m: p.m, l: cont };
+			}
+			const sol = { tempo: r, score: full.score, margin: full.score - stay, offset: pts[pts.length - 1].l - pts[pts.length - 1].m * r, steps: pts };
+			this.solved = sol;
+			// agreement of recognised phrases with the path
+			const agree = this.anchorsExt.filter((an) => an.w >= 0.5 && Math.abs(an.l - this.lAt(pts, r, an.m)) < 0.6).length;
+			const moved = r !== 1 || pts.some((p) => Math.abs(p.l - p.m) > 0.25);
+			if (moved && sol.margin < o.minMargin && !(agree >= 2 && !o.sameLength)) return false;
+			const map = Tracker.mapOf(pts, r);
+			// (the timing before the window stays as it was found)
+			if (keepBefore != null) map.set([...this.map.a.filter((p) => p.m < keepBefore - 0.06), ...map.a]);
+			this.map = map;
+			return true;
+		}
+
+		lAt(pts, r, m) {
+			let k = 0;
+			for (let i = 0; i < pts.length; ++i) if (pts[i].m <= m) k = i;
+			return pts[k].l + r * (m - pts[k].m);
+		}
+
+		// a TimeMap through the path: straight at tempo r between steps, jumps where it jumps
+		static mapOf(pts, r) {
+			const a = [];
+			for (let t = 0; t < pts.length; ++t) {
+				const p = pts[t];
+				if (t > 0) {
+					const q = pts[t - 1];
+					const expect = q.l + r * (p.m - q.m);
+					if (Math.abs(p.l - expect) > 0.35) a.push({ m: p.m - 0.05, l: q.l + r * (p.m - 0.05 - q.m) });
+				}
+				a.push(p);
+			}
+			const map = new KCL.TimeMap(a, { jumps: true, rate: r });
+			return map;
+		}
+
+		time(m) {
+			return this.map.toLyrics(m);
+		}
+	}
+
+	KCL.Tracker = Tracker;
+})(globalThis);

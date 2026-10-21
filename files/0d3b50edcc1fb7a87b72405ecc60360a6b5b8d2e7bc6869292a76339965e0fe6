@@ -1,0 +1,256 @@
+// Updates for an extension that is loaded from a folder (not from the Chrome Web Store).
+//
+// Chrome does not update such extensions, and an extension may not write to its own folder.
+// The one way: the person picks the extension's folder once (File System Access API); the
+// permission to write there is kept, and this module then
+//   1. reads latest.json from UPDATE_BASE and checks its signature (ECDSA P-256, UPDATE_KEY)
+//   2. compares the files with the installed ones (SHA-256) and downloads only what changed
+//   3. checks every downloaded file against the signed list
+//   4. writes them into the folder (manifest.json last), keeping the replaced files in
+//      update-backup/, and reloads the extension
+// The big model files are not part of updates (BASE_HEAVY): if they change, a new full
+// download is needed and the update says so.
+import { UPDATE_BASE, UPDATE_KEY, CHECK_EVERY_MIN } from './update-config.js';
+import { BASE_HEAVY } from './base.js';
+
+export { CHECK_EVERY_MIN };
+const DB = 'kc-update';
+const STORE = 'handles';
+const KEY = 'ext-folder';
+
+// ---------------------------------------------------------------- small helpers
+const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+export const sha256 = async (data) => hex(await crypto.subtle.digest('SHA-256', data));
+const b64 = (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
+
+export function newer(a, b) {
+	const x = String(a).split('.').map(Number), y = String(b).split('.').map(Number);
+	for (let i = 0; i < Math.max(x.length, y.length); ++i) {
+		const d = (x[i] || 0) - (y[i] || 0);
+		if (d) return d > 0;
+	}
+	return false;
+}
+
+// where updates are read from (a setting can point elsewhere: the signature still has to fit)
+export async function base() {
+	const { updateBase } = await chrome.storage.local.get('updateBase');
+	const b = updateBase || UPDATE_BASE;
+	return b.endsWith('/') ? b : b + '/';
+}
+
+// ---------------------------------------------------------------- the signed list
+// latest.json = {"payload": "<json text>", "sig": "<base64 of r||s>"}; the signature covers the
+// payload text exactly as it is written
+export async function verifyList(text) {
+	let outer;
+	try {
+		outer = JSON.parse(text);
+	} catch (e) {
+		throw new Error('latest.json is not JSON');
+	}
+	if (!outer || typeof outer.payload !== 'string' || typeof outer.sig !== 'string') throw new Error('latest.json has no signature');
+	const key = await crypto.subtle.importKey('jwk', UPDATE_KEY, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+	const ok = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, b64(outer.sig), new TextEncoder().encode(outer.payload));
+	if (!ok) throw new Error('signature does not match');
+	const p = JSON.parse(outer.payload);
+	if (!p || typeof p.version !== 'string' || !Array.isArray(p.files)) throw new Error('latest.json is malformed');
+	for (const f of p.files) {
+		// only plain relative paths inside the extension folder
+		if (typeof f.p !== 'string' || /(^|\/)\.\.?(\/|$)|^\/|\\|:/.test(f.p) || !/^[0-9a-f]{64}$/.test(f.h)) throw new Error('bad file entry: ' + f.p);
+	}
+	return p;
+}
+
+export async function fetchLatest(from = null) {
+	const root = from || (await base());
+	const r = await fetch(root + 'latest.json', { cache: 'no-store' });
+	if (!r.ok) throw new Error('HTTP ' + r.status);
+	return verifyList(await r.text());
+}
+
+// ---------------------------------------------------------------- what differs here
+async function localHash(path) {
+	try {
+		const r = await fetch(chrome.runtime.getURL(path), { cache: 'no-store' });
+		if (!r.ok) return null;
+		return await sha256(await r.arrayBuffer());
+	} catch (e) {
+		return null;
+	}
+}
+
+export async function plan(payload) {
+	const current = chrome.runtime.getManifest().version;
+	const out = { current, latest: payload.version, newer: newer(payload.version, current), changed: [], needsFull: false, notes: payload.notes || '' };
+	if (payload.baseHeavy !== undefined && payload.baseHeavy !== BASE_HEAVY) out.needsFull = true;
+	for (const f of payload.files) {
+		if ((await localHash(f.p)) !== f.h) out.changed.push(f);
+	}
+	return out;
+}
+
+// ---------------------------------------------------------------- the folder
+function db() {
+	return new Promise((resolve, reject) => {
+		const r = indexedDB.open(DB, 1);
+		r.onupgradeneeded = () => r.result.createObjectStore(STORE);
+		r.onsuccess = () => resolve(r.result);
+		r.onerror = () => reject(r.error);
+	});
+}
+export async function getFolder() {
+	const d = await db();
+	return new Promise((resolve) => {
+		const r = d.transaction(STORE).objectStore(STORE).get(KEY);
+		r.onsuccess = () => resolve(r.result || null);
+		r.onerror = () => resolve(null);
+	});
+}
+export async function saveFolder(handle) {
+	const d = await db();
+	return new Promise((resolve, reject) => {
+		const t = d.transaction(STORE, 'readwrite');
+		t.objectStore(STORE).put(handle, KEY);
+		t.oncomplete = () => resolve();
+		t.onerror = () => reject(t.error);
+	});
+}
+export async function forgetFolder() {
+	const d = await db();
+	return new Promise((resolve) => {
+		const t = d.transaction(STORE, 'readwrite');
+		t.objectStore(STORE).delete(KEY);
+		t.oncomplete = () => resolve();
+	});
+}
+
+export async function permission(handle, ask = false) {
+	if (!handle) return 'none';
+	const opts = { mode: 'readwrite' };
+	let p = await handle.queryPermission(opts);
+	if (p !== 'granted' && ask) p = await handle.requestPermission(opts); // needs a click
+	return p;
+}
+
+async function readText(dir, path) {
+	let d = dir;
+	const parts = path.split('/');
+	for (const part of parts.slice(0, -1)) d = await d.getDirectoryHandle(part);
+	const f = await (await d.getFileHandle(parts[parts.length - 1])).getFile();
+	return f.text();
+}
+
+// is this folder this extension's? (the manifest in it must be ours)
+export async function checkFolder(dir) {
+	let m;
+	try {
+		m = JSON.parse(await readText(dir, 'manifest.json'));
+	} catch (e) {
+		throw new Error('manifest.json');
+	}
+	// (the file as it is: getManifest() gives the translated name)
+	const mine = await (await fetch(chrome.runtime.getURL('manifest.json'), { cache: 'no-store' })).json();
+	if (m.name !== mine.name || m.version !== mine.version) throw new Error('other');
+	return true;
+}
+
+async function writeFile(dir, path, data) {
+	let d = dir;
+	const parts = path.split('/');
+	for (const part of parts.slice(0, -1)) d = await d.getDirectoryHandle(part, { create: true });
+	const fh = await d.getFileHandle(parts[parts.length - 1], { create: true });
+	const w = await fh.createWritable();
+	await w.write(data);
+	await w.close();
+}
+
+// ---------------------------------------------------------------- applying
+// `get(path)` can replace the download (tests). Returns the number of files written.
+export async function apply(payload, dir, { onProgress = () => {}, get = null, reload = () => chrome.runtime.reload() } = {}) {
+	const p = await plan(payload);
+	if (!p.newer) return { ok: true, written: 0, uptodate: true };
+	if (p.needsFull) throw new Error('needs-full');
+	await checkFolder(dir);
+	const root = await base();
+	// 1. everything downloaded and checked before anything is written
+	const staged = [];
+	let n = 0;
+	for (const f of p.changed) {
+		let data;
+		for (let attempt = 0; attempt < 3 && !data; ++attempt) {
+			try {
+				if (get) data = await get(f);
+				else {
+					const r = await fetch(root + 'files/' + f.h, { cache: 'no-store' });
+					if (!r.ok) throw new Error('HTTP ' + r.status);
+					data = await r.arrayBuffer();
+				}
+			} catch (e) {
+				if (attempt === 2) throw new Error('download ' + f.p + ': ' + e.message);
+				await new Promise((res) => setTimeout(res, 800 * (attempt + 1)));
+			}
+		}
+		if ((await sha256(data)) !== f.h) throw new Error('hash ' + f.p);
+		staged.push({ f, data });
+		onProgress(++n, p.changed.length * 2);
+	}
+	// 2. written: the replaced files are kept (update-backup/<old version>/), manifest last
+	const stamp = 'update-backup/' + p.current;
+	staged.sort((a, b) => (a.f.p === 'manifest.json') - (b.f.p === 'manifest.json'));
+	try {
+		await dir.removeEntry('update-backup', { recursive: true });
+	} catch (e) { /* none */ }
+	for (const { f, data } of staged) {
+		try {
+			const old = await readFile(dir, f.p);
+			if (old) await writeFile(dir, stamp + '/' + f.p, old);
+		} catch (e) { /* a new file: nothing to keep */ }
+		await writeFile(dir, f.p, data);
+		onProgress(++n, p.changed.length * 2);
+	}
+	await chrome.storage.local.set({ updateApplied: { from: p.current, to: payload.version, at: Date.now(), files: staged.length } });
+	await chrome.storage.local.remove('updateAvailable');
+	reload();
+	return { ok: true, written: staged.length, version: payload.version };
+}
+
+async function readFile(dir, path) {
+	let d = dir;
+	const parts = path.split('/');
+	for (const part of parts.slice(0, -1)) d = await d.getDirectoryHandle(part);
+	return (await (await d.getFileHandle(parts[parts.length - 1])).getFile()).arrayBuffer();
+}
+
+// ---------------------------------------------------------------- the check (background)
+// Looks for an update; takes it by itself when the folder is known, writable and nothing is
+// being processed (a reload ends the audio capture). Otherwise it is only noted.
+export async function check({ auto = true, busy = false, reload = undefined } = {}) {
+	const state = { checkedAt: Date.now() };
+	try {
+		const payload = await fetchLatest();
+		const p = await plan(payload);
+		state.latest = payload.version;
+		state.newer = p.newer;
+		state.needsFull = p.needsFull;
+		state.notes = payload.notes || '';
+		state.files = p.changed.length;
+		state.error = null;
+		if (p.newer) await chrome.storage.local.set({ updateAvailable: { version: payload.version, notes: state.notes, needsFull: p.needsFull, files: p.changed.length, at: Date.now() } });
+		else await chrome.storage.local.remove('updateAvailable');
+		if (p.newer && !p.needsFull && auto && !busy) {
+			const dir = await getFolder();
+			if (dir && (await permission(dir)) === 'granted') {
+				try {
+					state.applied = await apply(payload, dir, reload ? { reload } : {});
+				} catch (e) {
+					state.error = String(e.message || e);
+				}
+			} else state.waiting = dir ? 'permission' : 'folder';
+		}
+	} catch (e) {
+		state.error = String(e.message || e);
+	}
+	await chrome.storage.local.set({ updateCheck: state });
+	return state;
+}

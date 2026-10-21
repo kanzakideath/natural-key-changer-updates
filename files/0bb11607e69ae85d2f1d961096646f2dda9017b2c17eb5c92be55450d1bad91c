@@ -1,0 +1,199 @@
+// Real-time lyrics follower: what the panel asks "which lyrics time is it now?".
+//
+// On top of the aligner's map (re-solved every few seconds) it watches the singing itself.
+// In high-quality mode the analysis hears the audio before the listener does (the processed
+// sound is delayed), so it can:
+//   - hold a line that is due while nobody has started singing yet (an intro, a longer pause,
+//     a solo): the lyrics wait for the singer instead of running ahead;
+//   - start a line the moment its singing begins, a little before or after the map's estimate
+//     (covers and live takes are never exactly on the grid).
+(function (root) {
+	const KCL = (root.KCL = root.KCL || {});
+	const BIN = KCL.ALIGN_BIN;
+
+	class Follower {
+		constructor(lines, opts = {}) {
+			this.lines = lines.filter((l) => l.t != null && l.text);
+			this.al = new KCL.Aligner(this.lines);
+			this.map = new KCL.TimeMap();
+			// early snapping measured worse (test/lyrics/follow-eval.mjs): off unless asked for
+			this.opts = { minVoiced: 3, minMargin: 12, holdMax: 0, snapWindow: 0, hints: [], immediate: false, onsetAnchor: false, keepFix: false, firstHold: false, ...opts };
+			// the video is as long as the recording the lyrics belong to: most likely that very
+			// recording, so only clear evidence may move the lyrics
+			this.opts.sameLength = !!opts.sameLength;
+			if (opts.sameLength) this.opts.minMargin = Math.max(this.opts.minMargin, 30);
+			this.firstObs = null; // media time of the first analysed bin
+			this.started = false; // the singing of the first line has been found
+			this.obs = new Map(); // media bin -> voiced fraction (for onsets)
+			this.delta = 0; // local correction (s), lyrics time
+			this.holding = null; // {k, since}
+			this.lastSolve = -1e9;
+			this.solved = null;
+		}
+
+		add(m0, values) {
+			if (this.firstObs === null) this.firstObs = m0;
+			this.al.add(m0, values);
+			const k0 = Math.round(m0 / BIN);
+			for (let i = 0; i < values.length; ++i) this.obs.set(k0 + i, values[i]);
+			// bounded memory: keep ~15 minutes
+			if (this.obs.size > 9000) {
+				const keys = [...this.obs.keys()].sort((a, b) => a - b).slice(0, this.obs.size - 9000);
+				for (const k of keys) this.obs.delete(k);
+			}
+		}
+
+		// a recognised phrase: evidence for the next solve; a strong, unambiguous one also moves
+		// the lyrics right away (a cut verse, an inserted part) instead of waiting for it
+		addAnchor(m, l, w, { unique = false, sim = 0 } = {}) {
+			this.al.addAnchor(m, l, w);
+			if (this.opts.immediate && unique && sim >= 0.62) {
+				const now = this.map.toLyrics(m) + this.delta;
+				if (Math.abs(l - now) > 0.8) {
+					this.delta += l - now;
+					this.recentFix = this.lastM ?? m;
+				}
+			}
+		}
+
+		// re-solve the map (cheap: window scores are cached); returns true if it changed
+		solve(params) {
+			if (this.al.voicedSeconds < this.opts.minVoiced && !this.al.anchorsExt.length) return false;
+			const sol = this.al.solve({ hints: this.opts.hints, ...params });
+			this.solved = sol;
+			if (!sol) return false;
+			// recognised phrases that agree with the solution where they were heard: two of them
+			// are enough, whatever the margin
+			const agree = this.al.anchorsExt.filter((an) => an.w >= 0.5 && Math.abs(an.l - this.mapOf(sol, an.m)) < 0.5).length;
+			const agreeing = agree >= 2 && !this.opts.sameLength;
+			if (sol.margin < this.opts.minMargin && !agreeing && sol.tempo === 1 && Math.abs(sol.offset) > 0) return false;
+			// keep what is shown continuous: a correction the new map does not (yet) contain stays
+			const m = this.lastM;
+			const shown = m != null ? this.map.toLyrics(m) + this.delta : null;
+			this.map = new KCL.TimeMap(KCL.Aligner.anchors(sol));
+			const keep = (this.opts.keepFix && this.recentFix && m - this.recentFix < 20) || (this.keepUntil && m < this.keepUntil);
+			this.delta = keep && shown != null && Math.abs(shown - this.map.toLyrics(m)) > 0.5 ? shown - this.map.toLyrics(m) : 0;
+			return true;
+		}
+
+		// lyrics time at media time m according to a solution (its step nearest to m)
+		mapOf(sol, m) {
+			let best = sol.steps[0];
+			for (const s of sol.steps) if (Math.abs(s.m - m) < Math.abs(best.m - m)) best = s;
+			return best.l + (m - best.m) * (sol.tempo || 1);
+		}
+
+		voicedAt(m) {
+			const v = this.obs.get(Math.round(m / BIN));
+			return v === undefined ? null : v;
+		}
+
+		// singing starts in [a, b] (media time)? returns the onset time or null
+		onset(a, b) {
+			for (let m = a; m <= b + 1e-9; m += BIN) {
+				const now = this.voicedAt(m);
+				if (now === null || now < 0.5) continue;
+				let before = 0, n = 0;
+				for (let d = 1; d <= 4; ++d) {
+					const x = this.voicedAt(m - d * BIN);
+					if (x !== null) { before += x; n++; }
+				}
+				if (n >= 2 && before / n < 0.2) return m;
+			}
+			return null;
+		}
+
+		silentSince(m, horizon) {
+			// true if nobody sings in [m, horizon]: a stray voiced bin (a breath, a bleed from an
+			// instrument) does not count, 0.3 s of singing does
+			let run = 0;
+			for (let x = m; x <= horizon; x += BIN) {
+				const v = this.voicedAt(x);
+				run = v !== null && v >= 0.5 ? run + 1 : 0;
+				if (run >= 3) return false;
+			}
+			return true;
+		}
+
+		// first sustained singing (>= 0.5 s) in [a, b], or null
+		firstSinging(a, b) {
+			let run = 0, start = null;
+			for (let x = a; x <= b + 1e-9; x += BIN) {
+				const v = this.voicedAt(x);
+				if (v !== null && v >= 0.5) {
+					if (!run) start = x;
+					if (++run >= 5) return start;
+				} else run = 0;
+			}
+			return null;
+		}
+
+		// lyrics time at media time m, with audio analysed up to `horizon` (>= m)
+		time(m, horizon = m) {
+			this.lastM = m;
+			// Played from the start: the first line waits for the first singing. That moment is
+			// also the best evidence there is for the offset (a longer intro, a cover).
+			if (this.opts.firstHold && !this.started && this.firstObs !== null && this.firstObs <= 3 && this.lines.length) {
+				const first = this.lines[0];
+				const on = this.firstSinging(Math.max(0, this.firstObs), horizon);
+				if (on === null) {
+					const l0 = this.map.toLyrics(m) + this.delta;
+					// nothing sung yet: never run past the first line
+					if (l0 >= first.t - 0.01) return first.t - 0.01;
+					return l0;
+				}
+				this.started = true;
+				// the first line starts there (unless the map already says so)
+				const l0 = this.map.toLyrics(on) + this.delta;
+				if (Math.abs(l0 - first.t) > 0.4 && on <= first.t + 40) {
+					this.al.addAnchor(on, first.t, 3);
+					this.delta += first.t - l0;
+					this.recentFix = m;
+					this.keepUntil = m + 20;
+				}
+			}
+			const base = this.map.toLyrics(m);
+			let l = base + this.delta;
+			const L = this.lines;
+			const k = KCL.lineAt(L, l);
+			const next = L[k + 1];
+			// early start: the next line's singing has begun just before its time
+			if (next && next.t - l > 0 && next.t - l < this.opts.snapWindow) {
+				const prevEnd = k >= 0 ? Math.min(next.t, L[k].t + KCL.singDuration(L[k].text) * 1.3) : -1e9;
+				const pauseBefore = next.t - prevEnd;
+				if (pauseBefore > 0.4) {
+					const mExpected = m + (next.t - l);
+					const on = this.onset(Math.max(m - 0.3, mExpected - this.opts.snapWindow), Math.min(m, horizon));
+					if (on !== null) {
+						this.delta += next.t - l;
+						this.holding = null;
+						return next.t;
+					}
+				}
+			}
+			// just entered line k but nobody sings yet: hold it until they do (only where the
+			// lyrics have a pause before the line, i.e. the singer must start again)
+			if (k >= 0 && l - L[k].t < 1.2) {
+				const prevEnd = k > 0 ? Math.min(L[k].t, L[k - 1].t + KCL.singDuration(L[k - 1].text) * 1.3) : -1e9;
+				const pause = L[k].t - prevEnd;
+				const enteredAt = m - (l - L[k].t);
+				if (pause > 0.6 && this.silentSince(enteredAt - 0.2, horizon) && horizon - (enteredAt - 0.2) >= 0.4) {
+					if (!this.holding || this.holding.k !== k) this.holding = { k, since: m };
+					if (m - this.holding.since < this.opts.holdMax) {
+						this.delta -= l - L[k].t + 0.01;
+						return L[k].t - 0.01;
+					}
+				} else if (this.opts.onsetAnchor && this.holding && this.holding.k === k && m - this.holding.since > 0.5) {
+					// the singer started after a hold: that is where line k begins
+					this.al.addAnchor(m, L[k].t, 1);
+					this.recentFix = m;
+					this.holding = null;
+				}
+			}
+			if (this.holding && this.holding.k !== k) this.holding = null;
+			return l;
+		}
+	}
+
+	KCL.Follower = Follower;
+})(globalThis);

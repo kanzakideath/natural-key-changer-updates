@@ -1,0 +1,101 @@
+// Text helpers for lyrics: normalisation and fuzzy similarity that work for Japanese
+// (kana / kanji / full-width), English and mixed text.
+// Classic script (content scripts cannot be modules): everything hangs off globalThis.KCL.
+(function (root) {
+	const KCL = (root.KCL = root.KCL || {});
+
+	// katakana -> hiragana, full-width ASCII -> half-width, lower case, long vowel marks and
+	// punctuation removed, whitespace collapsed
+	function norm(s) {
+		if (!s) return '';
+		let out = '';
+		for (const ch of s.normalize('NFKC').toLowerCase()) {
+			const c = ch.codePointAt(0);
+			if (c >= 0x30a1 && c <= 0x30f6) out += String.fromCodePoint(c - 0x60); // katakana -> hiragana
+			else out += ch;
+		}
+		return out
+			.replace(/[ー〜~・･、。，．,.!?！？「」『』【】\[\]（）()〈〉《》"'“”‘’`´:;：；…‥\-–—_/\\|｜♪♫☆★○●◎◇◆□■△▲▽▼※＊*#＃&＆@＠%％+=<>{}]/g, ' ')
+			.replace(/\s+/g, ' ')
+			.trim();
+	}
+
+	// the same, without spaces (Japanese lyrics are compared character by character)
+	const compact = (s) => norm(s).replace(/ /g, '');
+
+	function bigrams(s) {
+		const m = new Map();
+		if (s.length === 1) m.set(s, 1);
+		for (let i = 0; i + 1 < s.length; ++i) {
+			const g = s.slice(i, i + 2);
+			m.set(g, (m.get(g) || 0) + 1);
+		}
+		return m;
+	}
+
+	// Sørensen–Dice coefficient on character bigrams (0..1), on compacted text
+	function dice(a, b) {
+		a = compact(a);
+		b = compact(b);
+		if (!a || !b) return 0;
+		if (a === b) return 1;
+		const A = bigrams(a), B = bigrams(b);
+		let inter = 0, na = 0, nb = 0;
+		for (const [g, n] of A) {
+			na += n;
+			if (B.has(g)) inter += Math.min(n, B.get(g));
+		}
+		for (const n of B.values()) nb += n;
+		return (2 * inter) / (na + nb);
+	}
+
+	// how much of `needle` appears in `hay` in order (longest common subsequence / |needle|)
+	function lcsRatio(needle, hay) {
+		const a = compact(needle), b = compact(hay);
+		if (!a || !b) return 0;
+		let prev = new Uint16Array(b.length + 1), cur = new Uint16Array(b.length + 1);
+		for (let i = 1; i <= a.length; ++i) {
+			for (let j = 1; j <= b.length; ++j) {
+				cur[j] = a[i - 1] === b[j - 1] ? prev[j - 1] + 1 : Math.max(prev[j], cur[j - 1]);
+			}
+			[prev, cur] = [cur, prev];
+		}
+		return prev[b.length] / a.length;
+	}
+
+	// title similarity: exact / containment / fuzzy
+	function titleSim(a, b) {
+		const x = compact(a), y = compact(b);
+		if (!x || !y) return 0;
+		if (x === y) return 1;
+		if (x.length >= 2 && y.length >= 2 && (x.includes(y) || y.includes(x))) {
+			return 0.75 + 0.2 * (Math.min(x.length, y.length) / Math.max(x.length, y.length));
+		}
+		return Math.max(dice(x, y), 0.9 * Math.min(lcsRatio(x, y), lcsRatio(y, x)));
+	}
+
+	const hasJapanese = (s) => /[぀-ヿ㐀-鿿]/.test(s || '');
+	const hasHangul = (s) => /[가-힯]/.test(s || '');
+
+	// character pairs of a line, counted once (for many comparisons)
+	function bigramsOf(text) {
+		const c = compact(text);
+		const m = new Map();
+		for (let i = 0; i + 1 < c.length; ++i) { const g = c.slice(i, i + 2); m.set(g, (m.get(g) || 0) + 1); }
+		return { c, m, n: Math.max(0, c.length - 1) };
+	}
+	// dice, or one line found inside the other, in linear time (a cheap KCL.lyricSim)
+	function fastSim(a, b) {
+		if (!a.c || !b.c) return 0;
+		if (a.c === b.c) return 1;
+		if (!a.n || !b.n) return 0;
+		let inter = 0;
+		const [x, y] = a.m.size < b.m.size ? [a.m, b.m] : [b.m, a.m];
+		for (const [g, k] of x) { const o = y.get(g); if (o) inter += Math.min(k, o); }
+		const d = (2 * inter) / (a.n + b.n);
+		const lo = Math.min(a.n, b.n);
+		return lo >= 4 ? Math.max(d, (0.85 * inter) / lo) : d;
+	}
+
+	Object.assign(KCL, { norm, compact, dice, lcsRatio, titleSim, hasJapanese, hasHangul, bigramsOf, fastSim });
+})(globalThis);

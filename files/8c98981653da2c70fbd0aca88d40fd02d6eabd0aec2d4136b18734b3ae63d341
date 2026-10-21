@@ -1,0 +1,268 @@
+// Note names, Japanese karaoke range notation, pitch detection and key recommendation.
+//
+// Karaoke notation (as used for vocal ranges in Japan): octaves start at A.
+//   lowA = A1 … lowG# = G#2, mid1A = A2 … mid1G# = G#3, mid2A = A3 … mid2G# = G#4,
+//   hiA = A4 (440 Hz) … hiG# = G#5, hihiA = A5 …
+// so mid2C = C4 (middle C), hiA = A4, hiC = C5.
+
+const NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+const BANDS = ['lowlowlow', 'lowlow', 'low', 'mid1', 'mid2', 'hi', 'hihi', 'hihihi'];
+
+export function hzToMidi(hz) {
+	return 69 + 12 * Math.log2(hz / 440);
+}
+
+export function midiToHz(m) {
+	return 440 * Math.pow(2, (m - 69) / 12);
+}
+
+// e.g. 60 -> "C4"
+export function scientific(m) {
+	m = Math.round(m);
+	return NAMES[((m % 12) + 12) % 12] + (Math.floor(m / 12) - 1);
+}
+
+// e.g. 60 -> "mid2C", 69 -> "hiA"
+export function karaoke(m) {
+	m = Math.round(m);
+	const band = Math.floor((m - 21) / 12) + 1; // A0 (21) = lowlowA, A1 = lowA
+	return (BANDS[band] ?? '?') + NAMES[((m % 12) + 12) % 12];
+}
+
+export const ALL_NOTES = Array.from({ length: 61 }, (_, i) => 36 + i); // C2..C7
+
+// --- pitch detection (YIN, de Cheveigné & Kawahara 2002) ---------------------------------
+// frame: Float32Array at `sampleRate`. Returns {hz, confidence} or null for unvoiced.
+export function yin(frame, sampleRate, fmin = 70, fmax = 1100, threshold = 0.15) {
+	const n = frame.length;
+	const maxLag = Math.min(Math.floor(sampleRate / fmin), Math.floor(n / 2));
+	const minLag = Math.max(2, Math.floor(sampleRate / fmax));
+	const W = n - maxLag;
+	let energy = 0;
+	for (let i = 0; i < W; ++i) energy += frame[i] * frame[i];
+	if (energy / W < 1e-6) return null;
+	const d = new Float32Array(maxLag + 1);
+	for (let tau = 1; tau <= maxLag; ++tau) {
+		let s = 0;
+		for (let i = 0; i < W; ++i) {
+			const x = frame[i] - frame[i + tau];
+			s += x * x;
+		}
+		d[tau] = s;
+	}
+	// cumulative mean normalised difference
+	let running = 0;
+	const cmnd = new Float32Array(maxLag + 1);
+	cmnd[0] = 1;
+	for (let tau = 1; tau <= maxLag; ++tau) {
+		running += d[tau];
+		cmnd[tau] = running > 0 ? (d[tau] * tau) / running : 1;
+	}
+	let tau = -1;
+	for (let t = minLag; t <= maxLag; ++t) {
+		if (cmnd[t] < threshold) {
+			while (t + 1 <= maxLag && cmnd[t + 1] < cmnd[t]) ++t;
+			tau = t;
+			break;
+		}
+	}
+	if (tau < 0) {
+		// no dip under the threshold (breathy / quiet voice): fall back to the global minimum
+		let best = -1;
+		for (let t = minLag; t <= maxLag; ++t) if (best < 0 || cmnd[t] < cmnd[best]) best = t;
+		if (best < 0 || cmnd[best] > 0.45) return null;
+		// prefer the shortest period that is nearly as good (avoids octave-low errors)
+		const limit = Math.min(0.45, cmnd[best] + 0.08);
+		tau = best;
+		for (let t = minLag + 1; t < best; ++t) {
+			if (cmnd[t] <= limit && cmnd[t] <= cmnd[t - 1] && cmnd[t] <= cmnd[t + 1]) {
+				tau = t;
+				break;
+			}
+		}
+	}
+	// octave check: if half the period (one octave up) fits almost as well, the longer period
+	// was a subharmonic (common when other instruments leak into the signal)
+	for (;;) {
+		const half = Math.round(tau / 2);
+		if (half < minLag) break;
+		let h = half;
+		for (let t = Math.max(minLag, half - 2); t <= Math.min(maxLag, half + 2); ++t) if (cmnd[t] < cmnd[h]) h = t;
+		if (cmnd[h] < Math.max(cmnd[tau] * 1.5, cmnd[tau] + 0.08) && cmnd[h] < 0.35) tau = h;
+		else break;
+	}
+	// parabolic interpolation
+	let better = tau;
+	if (tau > 1 && tau < maxLag) {
+		const a = cmnd[tau - 1], b = cmnd[tau], c = cmnd[tau + 1];
+		const den = a + c - 2 * b;
+		if (den !== 0) better = tau + (a - c) / (2 * den);
+	}
+	return { hz: sampleRate / better, confidence: 1 - cmnd[tau] };
+}
+
+// --- melody statistics -------------------------------------------------------------------
+// Histogram of sung notes (MIDI 24..108) weighted by duration in seconds.
+export class NoteHistogram {
+	constructor() {
+		this.bins = new Float64Array(128);
+		this.seconds = 0;
+	}
+	add(midi, seconds) {
+		const m = Math.round(midi);
+		if (m < 24 || m > 108) return;
+		this.bins[m] += seconds;
+		this.seconds += seconds;
+	}
+	merge(bins) {
+		for (let i = 0; i < 128; ++i) {
+			this.bins[i] += bins[i] || 0;
+			this.seconds += bins[i] || 0;
+		}
+	}
+	// note below which `p` of the singing time lies
+	percentile(p) {
+		if (this.seconds <= 0) return null;
+		let acc = 0;
+		for (let m = 0; m < 128; ++m) {
+			acc += this.bins[m];
+			if (acc >= p * this.seconds) return m;
+		}
+		return 127;
+	}
+	// Robust range of the melody. Separated vocals still carry a little of the band (bass,
+	// guitar), which shows up as small clusters away from the voice: keep only the notes that
+	// are connected to the main body of the singing (no gap of 3+ nearly-empty semitones),
+	// then ignore the rarest 2 % at the bottom and 1.5 % at the top.
+	range() {
+		if (this.seconds < 3) return null;
+		const bins = this.foldOctaveErrors();
+		const saved = this.bins;
+		this.bins = bins;
+		try {
+			return this.rangeOf();
+		} finally {
+			this.bins = saved;
+		}
+	}
+
+	// A note exactly an octave below (above) a much more frequent note, well away from the
+	// centre of the melody, is almost always the pitch tracker locking onto a subharmonic (harmonic).
+	foldOctaveErrors() {
+		const b = Float64Array.from(this.bins);
+		const median = this.percentile(0.5);
+		for (let m = 24; m + 12 < 128; ++m) {
+			if (m <= median - 7 && b[m] > 0 && b[m + 12] >= 4 * b[m]) {
+				b[m + 12] += b[m];
+				b[m] = 0;
+			}
+		}
+		for (let m = 127; m - 12 >= 0; --m) {
+			if (m >= median + 7 && b[m] > 0 && b[m - 12] >= 4 * b[m]) {
+				b[m - 12] += b[m];
+				b[m] = 0;
+			}
+		}
+		return b;
+	}
+
+	rangeOf() {
+		const median = this.percentile(0.5);
+		const tiny = this.seconds * 0.006;
+		let lo = median, hi = median;
+		for (let m = median - 1, gap = 0; m >= 24 && gap < 3; --m) {
+			if (this.bins[m] > tiny) { lo = m; gap = 0; } else ++gap;
+		}
+		for (let m = median + 1, gap = 0; m <= 108 && gap < 3; ++m) {
+			if (this.bins[m] > tiny) { hi = m; gap = 0; } else ++gap;
+		}
+		let total = 0;
+		for (let m = lo; m <= hi; ++m) total += this.bins[m];
+		const pct = (p) => {
+			let acc = 0;
+			for (let m = lo; m <= hi; ++m) {
+				acc += this.bins[m];
+				if (acc >= p * total) return m;
+			}
+			return hi;
+		};
+		return { low: pct(0.02), high: pct(0.985), seconds: total };
+	}
+}
+
+// Key shift for a voice range: the smallest change that puts the whole melody inside the
+// voice (0 if the original already fits; on a tie, the lower key, which is easier on the high
+// notes). If the melody is wider than the voice, notes too high count more than notes too low.
+export function recommendKey(song, voice) {
+	if (!song || !voice) return null;
+	let best = null;
+	for (let k = -12; k <= 12; ++k) {
+		const over = Math.max(0, song.high + k - voice.high);
+		const under = Math.max(0, voice.low - (song.low + k));
+		const cost = over * 10 + under * 6 + Math.abs(k) * 0.1 + (k > 0 ? 0.01 : 0);
+		if (!best || cost < best.cost) best = { key: k, cost, fits: over === 0 && under === 0, over, under };
+	}
+	return best;
+}
+
+// Streaming melody tracker: feed mono audio (any rate); keeps a NoteHistogram of the sung
+// notes. Octave jumps and other glitches are dropped by comparing each frame with the
+// median of its neighbours.
+export class MelodyTracker {
+	constructor(sampleRate) {
+		this.step = Math.max(1, Math.round(sampleRate / 16000));
+		this.fs = sampleRate / this.step;
+		this.N = 1024;
+		this.H = 256;
+		this.buf = new Float32Array(this.N);
+		this.ring = new Float32Array(this.N); // input ring; copied out in order once per hop
+		this.wpos = 0;
+		this.fill = 0;
+		this.onFrame = null; // optional (voiced, relativeLevel) per frame, for the lyrics timing
+		this.acc = 0;
+		this.accN = 0;
+		this.sinceHop = 0;
+		this.recent = []; // last 5 frame pitches (midi or null)
+		this.level = 0; // slow loudness follower, to skip quiet frames (breaths, bleed)
+		this.hist = new NoteHistogram();
+	}
+	push(samples) {
+		for (let i = 0; i < samples.length; ++i) {
+			this.acc += samples[i];
+			if (++this.accN < this.step) continue;
+			const x = this.acc / this.step;
+			this.acc = 0;
+			this.accN = 0;
+			this.ring[this.wpos] = x;
+			this.wpos = (this.wpos + 1) % this.N;
+			if (this.fill < this.N) this.fill++;
+			if (this.fill === this.N && ++this.sinceHop >= this.H) {
+				this.sinceHop = 0;
+				// oldest sample first
+				this.buf.set(this.ring.subarray(this.wpos), 0);
+				this.buf.set(this.ring.subarray(0, this.wpos), this.N - this.wpos);
+				this.frame();
+			}
+		}
+	}
+	frame() {
+		let e = 0;
+		for (let i = 0; i < this.N; ++i) e += this.buf[i] * this.buf[i];
+		const rms = Math.sqrt(e / this.N);
+		this.level = Math.max(rms, this.level * 0.995);
+		let midi = null;
+		if (rms > this.level * 0.08 && rms > 5e-4) {
+			const r = yin(this.buf, this.fs, 70, 1100, 0.2);
+			if (r && r.confidence > 0.55) midi = hzToMidi(r.hz);
+		}
+		if (this.onFrame) this.onFrame(midi != null, rms / (this.level || 1), rms);
+		this.recent.push(midi);
+		if (this.recent.length > 5) this.recent.shift();
+		if (this.recent.length < 5) return;
+		const c = this.recent[2];
+		const voiced = this.recent.filter((m) => m != null).sort((a, b) => a - b);
+		if (c == null || voiced.length < 4) return;
+		const med = voiced[Math.floor(voiced.length / 2)];
+		if (Math.abs(c - med) < 1.5) this.hist.add(c, this.H / this.fs);
+	}
+}

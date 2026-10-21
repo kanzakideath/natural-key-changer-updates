@@ -1,0 +1,51 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title data-i18n="updTitle">Update</title>
+<link rel="stylesheet" href="update.css">
+</head>
+<body>
+<main>
+	<header>
+		<img src="../icons/icon128.png" alt="" width="56" height="56">
+		<div>
+			<h1 data-i18n="updTitle"></h1>
+			<p id="versions"></p>
+		</div>
+	</header>
+
+	<section class="card" id="stateCard">
+		<div class="state" id="state"></div>
+		<p class="notes" id="notes"></p>
+		<div class="bar" id="bar" hidden><i></i></div>
+		<div class="actions">
+			<button id="check" class="btn" type="button" data-i18n="updCheck"></button>
+			<button id="apply" class="btn primary" type="button" hidden data-i18n="updApply"></button>
+		</div>
+		<p class="msg" id="msg" role="status"></p>
+	</section>
+
+	<section class="card">
+		<h2 data-i18n="updFolderTitle"></h2>
+		<p data-i18n="updFolderBody"></p>
+		<div class="row">
+			<button id="pick" class="btn" type="button" data-i18n="updPick"></button>
+			<span class="folder" id="folder"></span>
+		</div>
+		<p class="hint" data-i18n="updFolderHint"></p>
+	</section>
+
+	<section class="card">
+		<label class="row between">
+			<span><b data-i18n="updAuto"></b><br><small data-i18n="updAutoBody"></small></span>
+			<span class="switch"><input type="checkbox" id="auto" role="switch"><span class="track"><span class="thumb"></span></span></span>
+		</label>
+	</section>
+
+	<p class="foot" id="foot"></p>
+</main>
+<script type="module" src="update.js"></script>
+</body>
+</html>

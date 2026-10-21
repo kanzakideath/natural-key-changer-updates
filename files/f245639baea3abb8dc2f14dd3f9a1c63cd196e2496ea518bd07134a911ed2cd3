@@ -1,0 +1,372 @@
+// Whisper speech recognition on ONNX Runtime (the runtime the extension already ships), for
+// the lyrics: recognises the sung words with segment timestamps.
+//
+//  - log-mel features are computed incrementally (each 10 ms frame once), so re-running on an
+//    overlapping 30 s window costs only the model;
+//  - greedy decoding with Whisper's timestamp rules, optional prompt (the expected lyrics,
+//    which helps it spell the words the way the lyrics do);
+//  - guards against the usual failure modes on music: repeated text, low confidence.
+//
+// Model files: onnx-community/whisper-* (encoder_model*.onnx, decoder_model_merged*.onnx,
+// vocab.json, merges.txt, added_tokens.json). MIT licence (OpenAI Whisper).
+
+export const SR = 16000;
+const N_FFT = 400;
+const HOP = 160;
+const N_MELS = 80;
+const N_FRAMES = 3000; // 30 s
+const SOT = 50258, EOT = 50257, TRANSCRIBE = 50359, NO_TS = 50363, TS0 = 50364, PREV = 50361, NOSPEECH = 50362;
+export const LANG = { en: 50259, zh: 50260, de: 50261, es: 50262, ru: 50263, ko: 50264, fr: 50265, ja: 50266, pt: 50267, it: 50274 };
+
+// ------------------------------------------------------------------ features
+function melFilters() {
+	const hz2mel = (f) => (f < 1000 ? (3 * f) / 200 : 15 + (27 * Math.log(f / 1000)) / Math.log(6.4));
+	const mel2hz = (m) => (m < 15 ? (200 * m) / 3 : 1000 * Math.exp(((m - 15) * Math.log(6.4)) / 27));
+	const nb = N_FFT / 2 + 1;
+	const fftFreqs = Array.from({ length: nb }, (_, i) => (i * SR) / N_FFT);
+	const mMin = hz2mel(0), mMax = hz2mel(8000);
+	const pts = Array.from({ length: N_MELS + 2 }, (_, i) => mel2hz(mMin + ((mMax - mMin) * i) / (N_MELS + 1)));
+	const W = new Float32Array(N_MELS * nb);
+	for (let m = 0; m < N_MELS; ++m) {
+		const lo = pts[m], c = pts[m + 1], hi = pts[m + 2];
+		const enorm = 2 / (hi - lo); // slaney normalisation
+		for (let k = 0; k < nb; ++k) {
+			const f = fftFreqs[k];
+			const v = Math.max(0, Math.min((f - lo) / (c - lo), (hi - f) / (hi - c)));
+			W[m * nb + k] = v * enorm;
+		}
+	}
+	return W;
+}
+
+// real DFT of 400 points via precomputed twiddles (mixed radix is not worth it at this size:
+// one frame every 10 ms)
+const COS = new Float32Array((N_FFT / 2 + 1) * N_FFT), SIN = new Float32Array((N_FFT / 2 + 1) * N_FFT);
+for (let k = 0; k <= N_FFT / 2; ++k) for (let n = 0; n < N_FFT; ++n) {
+	COS[k * N_FFT + n] = Math.cos((2 * Math.PI * k * n) / N_FFT);
+	SIN[k * N_FFT + n] = Math.sin((2 * Math.PI * k * n) / N_FFT);
+}
+const HANN = Float32Array.from({ length: N_FFT }, (_, n) => 0.5 - 0.5 * Math.cos((2 * Math.PI * n) / N_FFT));
+const MEL = melFilters();
+
+// Streaming log-mel: push 16 kHz samples, get log10 mel frames (not yet normalised).
+export class MelStream {
+	constructor() {
+		this.buf = new Float32Array(0); // pending samples
+		this.frames = []; // Float32Array(80) per 10 ms
+		this.started = false;
+		this.pow = new Float32Array(N_FFT / 2 + 1);
+		this.seg = new Float32Array(N_FFT);
+	}
+	push(x) {
+		if (!this.started) {
+			// Whisper pads with a reflection of the first n_fft/2 samples
+			const pad = new Float32Array(N_FFT / 2);
+			for (let i = 0; i < pad.length; ++i) pad[i] = x[Math.min(x.length - 1, N_FFT / 2 - i)] || 0;
+			x = concat(pad, x);
+			this.started = true;
+		}
+		this.buf = concat(this.buf, x);
+		let off = 0;
+		while (off + N_FFT <= this.buf.length) {
+			this.frames.push(this.frame(this.buf, off));
+			off += HOP;
+		}
+		this.buf = this.buf.slice(off);
+	}
+	frame(b, off) {
+		const s = this.seg;
+		for (let n = 0; n < N_FFT; ++n) s[n] = b[off + n] * HANN[n];
+		const nb = N_FFT / 2 + 1;
+		for (let k = 0; k < nb; ++k) {
+			let re = 0, im = 0;
+			const base = k * N_FFT;
+			for (let n = 0; n < N_FFT; ++n) {
+				re += s[n] * COS[base + n];
+				im -= s[n] * SIN[base + n];
+			}
+			this.pow[k] = re * re + im * im;
+		}
+		const out = new Float32Array(N_MELS);
+		for (let m = 0; m < N_MELS; ++m) {
+			let v = 0;
+			const base = m * nb;
+			for (let k = 0; k < nb; ++k) v += MEL[base + k] * this.pow[k];
+			out[m] = Math.log10(Math.max(v, 1e-10));
+		}
+		return out;
+	}
+	// model input for frames [a, a + n): normalised as Whisper does, zero-padded (silence).
+	// n < 3000 needs the dynamic-length encoder (engines/asr/make_dynamic_encoder.py).
+	input(a, n = N_FRAMES) {
+		const x = new Float32Array(N_MELS * n);
+		let mx = -Infinity;
+		const end = Math.min(this.frames.length, a + n);
+		for (let f = a; f < end; ++f) for (let m = 0; m < N_MELS; ++m) mx = Math.max(mx, this.frames[f][m]);
+		const silence = Math.log10(1e-10);
+		const floor = Math.max(silence, mx - 8);
+		for (let m = 0; m < N_MELS; ++m) {
+			for (let i = 0; i < n; ++i) {
+				const f = a + i;
+				const v = f < end ? Math.max(this.frames[f][m], floor) : Math.max(silence, floor);
+				x[m * n + i] = (v + 4) / 4;
+			}
+		}
+		return x;
+	}
+	// drop frames before `a` (keeps memory bounded); returns how many were dropped
+	trim(a) {
+		const n = Math.max(0, Math.min(a, this.frames.length));
+		this.frames.splice(0, n);
+		return n;
+	}
+}
+
+function concat(a, b) {
+	const o = new Float32Array(a.length + b.length);
+	o.set(a);
+	o.set(b, a.length);
+	return o;
+}
+
+// ------------------------------------------------------------------ tokenizer (byte-level BPE)
+function bytesToUnicode() {
+	const bs = [];
+	for (let i = 33; i <= 126; ++i) bs.push(i);
+	for (let i = 161; i <= 172; ++i) bs.push(i);
+	for (let i = 174; i <= 255; ++i) bs.push(i);
+	const cs = bs.slice();
+	let n = 0;
+	for (let b = 0; b < 256; ++b) if (!bs.includes(b)) { bs.push(b); cs.push(256 + n++); }
+	const enc = new Map(), dec = new Map();
+	bs.forEach((b, i) => { enc.set(b, String.fromCodePoint(cs[i])); dec.set(String.fromCodePoint(cs[i]), b); });
+	return { enc, dec };
+}
+
+export class Tokenizer {
+	constructor(vocab, merges, added = {}) {
+		this.vocab = vocab;
+		this.inv = new Map();
+		for (const [t, id] of Object.entries(vocab)) this.inv.set(id, t);
+		for (const [t, id] of Object.entries(added)) this.inv.set(id, t);
+		this.ranks = new Map();
+		merges.split('\n').filter((l) => l && !l.startsWith('#version')).forEach((l, i) => this.ranks.set(l, i));
+		const { enc, dec } = bytesToUnicode();
+		this.enc = enc;
+		this.dec = dec;
+		this.cache = new Map();
+		this.utf8 = new TextEncoder();
+		this.utf8d = new TextDecoder('utf-8', { fatal: false });
+	}
+	bpe(token) {
+		if (this.cache.has(token)) return this.cache.get(token);
+		let word = [...token];
+		while (word.length > 1) {
+			let best = null, bestRank = Infinity;
+			for (let i = 0; i + 1 < word.length; ++i) {
+				const r = this.ranks.get(word[i] + ' ' + word[i + 1]);
+				if (r !== undefined && r < bestRank) { bestRank = r; best = i; }
+			}
+			if (best === null) break;
+			word = [...word.slice(0, best), word[best] + word[best + 1], ...word.slice(best + 2)];
+		}
+		this.cache.set(token, word);
+		return word;
+	}
+	encode(text) {
+		const ids = [];
+		const re = /'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+/gu;
+		for (const m of text.matchAll(re)) {
+			const bytes = this.utf8.encode(m[0]);
+			const u = Array.from(bytes, (b) => this.enc.get(b)).join('');
+			for (const piece of this.bpe(u)) {
+				const id = this.vocab[piece];
+				if (id !== undefined) ids.push(id);
+			}
+		}
+		return ids;
+	}
+	decode(ids) {
+		const bytes = [];
+		for (const id of ids) {
+			if (id >= EOT) continue;
+			const t = this.inv.get(id);
+			if (!t) continue;
+			for (const ch of t) {
+				const b = this.dec.get(ch);
+				if (b !== undefined) bytes.push(b);
+			}
+		}
+		return this.utf8d.decode(new Uint8Array(bytes));
+	}
+}
+
+// ------------------------------------------------------------------ model
+export class Whisper {
+	// ort: the onnxruntime module; files: {encoder, decoder} (URLs or bytes); tok: Tokenizer
+	static async create(ort, { encoder, decoder, tokenizer, providers = ['wasm'], layers = 6, heads = 8, headDim = 64, sessionExtra = null }) {
+		const w = new Whisper();
+		// weight-only int8 decoders: keep DequantizeLinear separate so it is folded into float
+		// weights at load (float32 matmuls are faster than integer ones on WASM)
+		const opts = { executionProviders: providers, graphOptimizationLevel: 'all', ...(sessionExtra ? { extra: { session: sessionExtra } } : {}) };
+		w.ort = ort;
+		w.enc = await ort.InferenceSession.create(encoder, opts);
+		w.dec = await ort.InferenceSession.create(decoder, opts);
+		w.tok = tokenizer;
+		w.layers = layers;
+		w.heads = heads;
+		w.headDim = headDim;
+		return w;
+	}
+
+	async encode(mel) {
+		const { ort } = this;
+		const out = await this.enc.run({ input_features: new ort.Tensor('float32', mel, [1, N_MELS, mel.length / N_MELS]) });
+		return out.last_hidden_state;
+	}
+
+	// Greedy decoding with timestamps. Returns segments [{a, b, text, logprob, tokens}] (seconds
+	// within the 30 s window).
+	async transcribe(mel, { lang = null, prompt = '', maxTokens = 180, endFrame = N_FRAMES } = {}) {
+		const { ort } = this;
+		const enc = await this.encode(mel);
+		const pre = [];
+		if (prompt) {
+			const p = this.tok.encode(' ' + prompt.trim()).slice(-200);
+			if (p.length) pre.push(PREV, ...p);
+		}
+		pre.push(SOT);
+		let language = lang;
+		const empty = (n) => new ort.Tensor('float32', new Float32Array(0), [1, this.heads, n, this.headDim]);
+		const feeds = (ids, past, useCache) => {
+			const f = {
+				input_ids: new ort.Tensor('int64', BigInt64Array.from(ids.map(BigInt)), [1, ids.length]),
+				encoder_hidden_states: enc,
+				use_cache_branch: new ort.Tensor('bool', [useCache], [1]),
+			};
+			for (let l = 0; l < this.layers; ++l) {
+				for (const kind of ['decoder', 'encoder']) for (const kv of ['key', 'value']) {
+					f[`past_key_values.${l}.${kind}.${kv}`] = past ? past[`present.${l}.${kind}.${kv}`] : empty(0);
+				}
+			}
+			return f;
+		};
+		// language detection (if not given): one step after SOT
+		let out = await this.dec.run(feeds(pre, null, false));
+		const encKV = out; // the encoder keys/values are computed in this first pass only
+		let logits = lastLogits(out.logits);
+		if (!language) {
+			let best = null;
+			for (const [code, id] of Object.entries(LANG)) if (!best || logits[id] > logits[LANG[best]]) best = code;
+			language = best;
+		}
+		// continue: <|lang|><|transcribe|>
+		const noSpeech = softmaxAt(logits, NOSPEECH);
+		out = await this.dec.run(feeds([LANG[language] || LANG.en, TRANSCRIBE], keepEncoder(out, encKV), true));
+		let past = out;
+		logits = lastLogits(out.logits);
+
+		const tokens = [];
+		const lps = [];
+		const frames = mel.length / N_MELS;
+		const maxTs = TS0 + Math.min(frames / 2, Math.ceil(Math.min(endFrame, frames) / 2)); // no timestamps past the audio
+		for (let step = 0; step < maxTokens; ++step) {
+			const l = Float32Array.from(logits);
+			// suppress: <|notimestamps|>, special tokens other than EOT / timestamps
+			l[NO_TS] = -Infinity;
+			for (let i = EOT + 1; i < TS0; ++i) l[i] = -Infinity;
+			for (let i = maxTs + 1; i < l.length; ++i) l[i] = -Infinity;
+			const last = tokens[tokens.length - 1], prev = tokens[tokens.length - 2];
+			const lastTs = last >= TS0, prevTs = prev === undefined || prev >= TS0;
+			if (tokens.length === 0) {
+				// must start with a timestamp, not later than 1 s
+				for (let i = 0; i < TS0; ++i) l[i] = -Infinity;
+				for (let i = TS0 + 51; i < l.length; ++i) l[i] = -Infinity;
+			} else if (lastTs) {
+				if (prevTs) for (let i = TS0; i < l.length; ++i) l[i] = -Infinity; // pair closed: text next
+				else for (let i = 0; i < EOT; ++i) l[i] = -Infinity; // open: timestamp or end
+			}
+			// timestamps never go back
+			const tsSeen = tokens.filter((t) => t >= TS0);
+			if (tsSeen.length) {
+				const lim = tsSeen[tsSeen.length - 1] + (lastTs && !prevTs ? 0 : 1);
+				for (let i = TS0; i < Math.min(lim, l.length); ++i) l[i] = -Infinity;
+			}
+			// if timestamps are together more likely than any text token, take a timestamp
+			const lsm = logSoftmax(l);
+			let tsLse = -Infinity, maxText = -Infinity;
+			for (let i = TS0; i < lsm.length; ++i) tsLse = logAdd(tsLse, lsm[i]);
+			for (let i = 0; i < TS0; ++i) if (lsm[i] > maxText) maxText = lsm[i];
+			if (tsLse > maxText) for (let i = 0; i < TS0; ++i) lsm[i] = -Infinity;
+			let tok = 0;
+			for (let i = 1; i < lsm.length; ++i) if (lsm[i] > lsm[tok]) tok = i;
+			if (tok === EOT) break;
+			tokens.push(tok);
+			lps.push(lsm[tok]);
+			// repetition guard: the same 4-gram three times means it is looping
+			if (looping(tokens)) break;
+			out = await this.dec.run(feeds([tok], keepEncoder(past, encKV), true));
+			past = out;
+			logits = lastLogits(out.logits);
+		}
+		return { language, noSpeech, segments: this.segments(tokens, lps) };
+	}
+
+	segments(tokens, lps) {
+		const segs = [];
+		let start = null, text = [], lp = [];
+		for (let i = 0; i < tokens.length; ++i) {
+			const t = tokens[i];
+			if (t >= TS0) {
+				const time = (t - TS0) * 0.02;
+				if (start === null) start = time;
+				else {
+					if (text.length) segs.push({ a: start, b: time, text: this.tok.decode(text).trim(), logprob: avg(lp), tokens: text.length });
+					start = null;
+					text = [];
+					lp = [];
+				}
+			} else if (start !== null) {
+				text.push(t);
+				lp.push(lps[i]);
+			}
+		}
+		return segs.filter((s) => s.text);
+	}
+}
+
+// the merged decoder recomputes nothing for the encoder once cached: carry those tensors
+function keepEncoder(past, encKV) {
+	const out = {};
+	for (const k of Object.keys(past)) out[k] = k.includes('.encoder.') ? encKV[k] : past[k];
+	return out;
+}
+
+function lastLogits(t) {
+	const [, n, v] = t.dims;
+	return t.data.subarray((n - 1) * v, n * v);
+}
+function logSoftmax(l) {
+	let mx = -Infinity;
+	for (const x of l) if (x > mx) mx = x;
+	let s = 0;
+	for (const x of l) if (x !== -Infinity) s += Math.exp(x - mx);
+	const lse = mx + Math.log(s);
+	return Float32Array.from(l, (x) => x - lse);
+}
+function softmaxAt(l, i) {
+	const ls = logSoftmax(Float32Array.from(l));
+	return Math.exp(ls[i]);
+}
+const logAdd = (a, b) => (a === -Infinity ? b : b === -Infinity ? a : Math.max(a, b) + Math.log1p(Math.exp(-Math.abs(a - b))));
+const avg = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0);
+function looping(tokens) {
+	const n = tokens.length;
+	if (n < 12) return false;
+	const g = tokens.slice(n - 4).join(',');
+	let c = 0;
+	for (let i = 0; i + 4 <= n; ++i) if (tokens.slice(i, i + 4).join(',') === g) c++;
+	return c >= 3;
+}
+
+export const WHISPER = { SR, N_FRAMES, HOP };

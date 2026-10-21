@@ -1,0 +1,73 @@
+// Settings shared by the popup, background and offscreen document.
+export const DEFAULTS = {
+	semitones: 0, // -12..+12
+	formant: 0, // voice character: semitones of extra formant shift (-3..+3); 0 = keep the original
+	mode: 'hq', // 'hq' (natural, AI separation) | 'light'
+	bypass: false, // play the original (A/B comparison)
+	engine: 'rubberband-r3', // engine for light mode
+	videoSync: true, // delay the video to match the processed audio
+	lyrics: true, // synced lyrics panel on YouTube
+	lyricsAi: true, // let the speech recogniser listen (timing; songs without lyrics anywhere)
+	lyricsHeard: false, // also show what it heard where the lyrics differ (a helper, off by default)
+	vocalGain: 1, // vocal volume in hq mode (0 = karaoke / instrumental)
+	autoKey: true, // remember the key per song and restore it
+	autoUpdate: true, // take updates by itself (once the extension's folder has been chosen)
+};
+
+// Light-mode engines offered in the UI. LiveShifter and Signalsmith (with formant
+// preservation) were dropped after testing: never better than these two.
+export const LIGHT_ENGINES = [
+	['rubberband-r3', 'engineR3'],
+	['rubberband-r3-short', 'engineShort'],
+];
+
+export async function loadSettings() {
+	const stored = await chrome.storage.local.get('settings');
+	return { ...DEFAULTS, ...(stored.settings || {}) };
+}
+
+export async function saveSettings(settings) {
+	await chrome.storage.local.set({ settings });
+}
+
+// --- per-song memory (key book) and the user's voice range ---------------------------------
+
+// Stable id for "the same song" across visits.
+export function songIdFromUrl(url) {
+	try {
+		const u = new URL(url);
+		const host = u.hostname.replace(/^(www|m|music)\./, '');
+		if (host === 'youtube.com' && u.searchParams.get('v')) return 'yt:' + u.searchParams.get('v');
+		if (host === 'youtube.com' && u.pathname.startsWith('/shorts/')) return 'yt:' + u.pathname.split('/')[2];
+		if (host === 'youtu.be') return 'yt:' + u.pathname.slice(1);
+		const tt = u.pathname.match(/\/video\/(\d+)/);
+		if (host === 'tiktok.com' && tt) return 'tt:' + tt[1];
+		if (u.protocol === 'http:' || u.protocol === 'https:') return u.origin + u.pathname;
+	} catch (e) { /* not a URL */ }
+	return null;
+}
+
+export function cleanTitle(title) {
+	return (title || '').replace(/^\(\d+\)\s*/, '').replace(/\s*[-|]\s*(YouTube|TikTok).*$/i, '').trim();
+}
+
+export async function loadSongs() {
+	return (await chrome.storage.local.get('songs')).songs || {};
+}
+
+export async function saveSong(id, patch) {
+	if (!id) return;
+	const songs = await loadSongs();
+	songs[id] = { ...(songs[id] || {}), ...patch, savedAt: Date.now() };
+	await chrome.storage.local.set({ songs });
+}
+
+export async function deleteSong(id) {
+	const songs = await loadSongs();
+	delete songs[id];
+	await chrome.storage.local.set({ songs });
+}
+
+export async function loadVoice() {
+	return (await chrome.storage.local.get('voice')).voice || null;
+}
