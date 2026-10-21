@@ -5,3 +5,5 @@ Signed update files for the **Natural Key Changer** Chrome extension. The extens
 only the files that changed (`files/<sha256>`). Nothing here is meant to be used by hand.
 
 Published with `tools/publish-update.mjs` of the extension's project.
+
+The phone edition (iPhone / Android userscript) lives in [`mobile/`](mobile/README.md).
