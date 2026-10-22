@@ -1,0 +1,133 @@
+// The update page: where the extension's folder is chosen (once) and an update is taken with
+// one click. (A page, not the popup: the popup closes when the folder dialog opens.)
+import { t, localize } from '../lib/i18n.js';
+import * as up from '../lib/updater.js';
+import { loadSettings, saveSettings } from '../lib/settings.js';
+
+localize();
+const $ = (id) => document.getElementById(id);
+const say = (text, kind = '') => { $('msg').textContent = text; $('msg').className = 'msg ' + kind; };
+const version = chrome.runtime.getManifest().version;
+let payload = null, info = null;
+
+async function folderStatus() {
+	const dir = await up.getFolder();
+	if (!dir) { $('folder').textContent = t('updNoFolder'); $('folder').className = 'folder'; return null; }
+	let perm = 'prompt';
+	try { perm = await up.permission(dir); } catch (e) { /* gone */ }
+	$('folder').textContent = `${dir.name}  ·  ${perm === 'granted' ? t('updFolderOk') : t('updFolderAsk')}`;
+	$('folder').className = 'folder' + (perm === 'granted' ? ' ok' : '');
+	return dir;
+}
+
+function paint() {
+	$('versions').textContent = t('updVersions', version);
+	const s = $('state');
+	s.className = 'state';
+	$('apply').hidden = true;
+	$('notes').textContent = '';
+	if (!info) { s.textContent = t('updUnknown'); return; }
+	if (info.error) {
+		// nothing published yet is not a problem
+		if (/HTTP 404/.test(info.error)) { s.textContent = t('updNotPublished'); return; }
+		s.className = 'state bad';
+		s.textContent = t('updError');
+		say(info.error, 'bad');
+		return;
+	}
+	if (info.needsFull) { s.className = 'state warn'; s.textContent = t('updNeedsFull', info.latest); return; }
+	if (info.newer) {
+		s.className = 'state new';
+		s.textContent = t('updAvailable', info.latest);
+		$('notes').textContent = info.notes || '';
+		$('apply').hidden = false;
+		return;
+	}
+	s.textContent = t('updLatest');
+}
+
+async function look() {
+	$('check').disabled = true;
+	say('');
+	try {
+		payload = await up.fetchLatest();
+		const p = await up.plan(payload);
+		info = { latest: payload.version, newer: p.newer, needsFull: p.needsFull, notes: payload.notes || '', files: p.changed.length };
+	} catch (e) {
+		info = { error: String(e.message || e) };
+	}
+	paint();
+	$('check').disabled = false;
+}
+
+$('check').addEventListener('click', look);
+
+$('pick').addEventListener('click', async () => {
+	say('');
+	let dir;
+	try {
+		dir = await showDirectoryPicker({ id: 'kc-extension', mode: 'readwrite' });
+	} catch (e) {
+		if (e && e.name === 'AbortError') return;
+		say(t('updPickBlocked'), 'bad');
+		return;
+	}
+	try {
+		await up.checkFolder(dir);
+	} catch (e) {
+		say(e.message === 'manifest.json' ? t('updNoManifest') : t('updOtherFolder'), 'bad');
+		return;
+	}
+	await up.saveFolder(dir);
+	await folderStatus();
+	say(t('updFolderSaved'), 'ok');
+});
+
+$('apply').addEventListener('click', async () => {
+	const dir = await up.getFolder();
+	if (!dir) { say(t('updNeedFolder'), 'bad'); $('pick').focus(); return; }
+	let perm;
+	try { perm = await up.permission(dir, true); } catch (e) { perm = 'denied'; }
+	if (perm !== 'granted') { say(t('updDenied'), 'bad'); return; }
+	$('apply').disabled = $('check').disabled = true;
+	$('bar').hidden = false;
+	say(t('updApplying'));
+	try {
+		if (!payload) payload = await up.fetchLatest();
+		const r = await up.apply(payload, dir, {
+			onProgress: (n, total) => { $('bar').firstElementChild.style.width = Math.round((100 * n) / total) + '%'; },
+			// the page is reloaded with the extension: say so first
+			// (processing is stopped first, the normal way: the page gets its video back and the
+			// lyrics their normal timing - a reload in the middle of it would leave them behind)
+			reload: async () => {
+				say(t('updDone', payload.version), 'ok');
+				try { await chrome.runtime.sendMessage({ target: 'background', type: 'stop' }); } catch (e) { /* not running */ }
+				setTimeout(() => chrome.runtime.reload(), 900);
+			},
+		});
+		if (r.uptodate) say(t('updLatest'), 'ok');
+	} catch (e) {
+		const m = String(e.message || e);
+		say(m === 'needs-full' ? t('updNeedsFull', payload.version) : m === 'other' || m === 'manifest.json' ? t('updOtherFolder') : t('updFailed') + '\n' + m, 'bad');
+		$('apply').disabled = $('check').disabled = false;
+		$('bar').hidden = true;
+	}
+});
+
+const auto = $('auto');
+loadSettings().then((s) => { auto.checked = s.autoUpdate !== false; });
+auto.addEventListener('change', async () => {
+	const s = await loadSettings();
+	s.autoUpdate = auto.checked;
+	await saveSettings(s);
+});
+
+(async () => {
+	$('foot').textContent = t('updFoot');
+	await folderStatus();
+	paint();
+	const { updateAvailable } = await chrome.storage.local.get('updateAvailable');
+	if (updateAvailable) info = { latest: updateAvailable.version, newer: true, needsFull: updateAvailable.needsFull, notes: updateAvailable.notes };
+	paint();
+	look();
+})();

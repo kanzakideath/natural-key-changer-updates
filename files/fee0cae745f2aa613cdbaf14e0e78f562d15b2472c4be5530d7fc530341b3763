@@ -1,0 +1,778 @@
+{
+	"appName": {
+		"message": "ナチュラル・キーチェンジャー"
+	},
+	"appShort": {
+		"message": "キー変更"
+	},
+	"appDesc": {
+		"message": "YouTube・TikTokなどで再生中の曲のキーを、歌声の響きを保ったまま半音単位で変更。カラオケの練習に。処理はすべてパソコンの中で行います。"
+	},
+	"cmdOpen": {
+		"message": "キー変更のパネルを開く"
+	},
+	"cmdKeyUp": {
+		"message": "キーを半音上げる"
+	},
+	"cmdKeyDown": {
+		"message": "キーを半音下げる"
+	},
+	"cmdBypass": {
+		"message": "元の音と聴き比べる（切り替え）"
+	},
+	"titleKey": {
+		"message": "キー変更"
+	},
+	"titlePractice": {
+		"message": "練習"
+	},
+	"tabKey": {
+		"message": "キー"
+	},
+	"tabPractice": {
+		"message": "練習"
+	},
+	"powerLabel": {
+		"message": "このタブでオン/オフ"
+	},
+	"settings": {
+		"message": "設定"
+	},
+	"turnOn": {
+		"message": "オンにする"
+	},
+	"turnOnSub": {
+		"message": "このタブの音のキーを変えます"
+	},
+	"turnOnSubOther": {
+		"message": "別のタブで動作中 → このタブに切り替えます"
+	},
+	"chipMode": {
+		"message": "モード"
+	},
+	"chipDelay": {
+		"message": "遅れ"
+	},
+	"chipLoad": {
+		"message": "負担"
+	},
+	"modeLight": {
+		"message": "軽量"
+	},
+	"modeHq": {
+		"message": "高音質"
+	},
+	"preparing": {
+		"message": "準備中…"
+	},
+	"loadLow": {
+		"message": "余裕あり"
+	},
+	"loadMid": {
+		"message": "やや重い"
+	},
+	"loadHigh": {
+		"message": "重い"
+	},
+	"seconds": {
+		"message": "$VALUE$秒",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"key": {
+		"message": "キー"
+	},
+	"keyReset": {
+		"message": "元のキー"
+	},
+	"keyDown": {
+		"message": "半音下げる"
+	},
+	"keyUp": {
+		"message": "半音上げる"
+	},
+	"semitones": {
+		"message": "半音"
+	},
+	"abTitle": {
+		"message": "元の音と聴き比べる"
+	},
+	"abTitleOn": {
+		"message": "元の音を再生中"
+	},
+	"abSub": {
+		"message": "タップで 加工後 ⇄ 元の音"
+	},
+	"abSubOn": {
+		"message": "タップで加工後の音に戻る"
+	},
+	"abSubOff": {
+		"message": "オンにすると使えます"
+	},
+	"hintLight": {
+		"message": "遅れ約0.1秒・軽い。声の響きを保ったまま、曲全体のキーを変えます。"
+	},
+	"hintHq": {
+		"message": "おすすめ。歌声と伴奏をAIで分けて別々に変えるので、いちばん自然。遅れ約0.7秒（映像も合わせます）。"
+	},
+	"noticePreparing": {
+		"message": "AIを準備しています…（その間は軽量モードで再生します）"
+	},
+	"noticeHqUnavailable": {
+		"message": "このパソコンでは高音質モードを使えないため、軽量モードで動作しています"
+	},
+	"noticeFallbackUnderrun": {
+		"message": "パソコンの処理が追いつかず音が途切れたため、軽量モードに切り替えました"
+	},
+	"noticeFallbackError": {
+		"message": "分離AIでエラーが起きたため、軽量モードに切り替えました"
+	},
+	"noticeStartFailed": {
+		"message": "このタブでは開始できませんでした：$VALUE$",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"noticeRestricted": {
+		"message": "このページ（Chromeの設定画面やストアなど）では使えません。動画サイトを開いてください。"
+	},
+	"noticeNoAudio": {
+		"message": "このタブはまだ音を出していません。動画を再生するとキーが変わります。"
+	},
+	"noticeLoop": {
+		"message": "このページでは区間リピートを使えません"
+	},
+	"noticeNoVideo": {
+		"message": "動画が見つかりませんでした"
+	},
+	"vocal": {
+		"message": "歌声の大きさ"
+	},
+	"vocalKaraoke": {
+		"message": "0%（カラオケ）"
+	},
+	"choiceKaraoke": {
+		"message": "カラオケ（0%）"
+	},
+	"choiceGuide": {
+		"message": "ガイド（30%）"
+	},
+	"choiceFull": {
+		"message": "そのまま"
+	},
+	"lockedText": {
+		"message": "歌声と伴奏を分ける高音質モードで使えます"
+	},
+	"toHq": {
+		"message": "高音質にする"
+	},
+	"rangeTitle": {
+		"message": "音域とおすすめキー"
+	},
+	"measureOff": {
+		"message": "オンにして再生すると測れます"
+	},
+	"measureSaved": {
+		"message": "保存済みの測定"
+	},
+	"measureHqOnly": {
+		"message": "高音質モードで測れます"
+	},
+	"measureProgress": {
+		"message": "測定中… $VALUE$%",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"measureDone": {
+		"message": "測定済み（歌声 $VALUE$秒分）",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"thisSong": {
+		"message": "この曲"
+	},
+	"you": {
+		"message": "あなた"
+	},
+	"notSet": {
+		"message": "未登録"
+	},
+	"register": {
+		"message": "登録"
+	},
+	"edit": {
+		"message": "変更"
+	},
+	"recNeedVoice": {
+		"message": "自分の音域を登録すると、合うキーをおすすめします"
+	},
+	"recNeedSong": {
+		"message": "曲の音域を測ると、合うキーをおすすめします"
+	},
+	"recCurrent": {
+		"message": "今のキー$VALUE$がおすすめです",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"recSuggest": {
+		"message": "おすすめ$VALUE$",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"recOver": {
+		"message": "（最高音が$VALUE$半音はみ出します）",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"recUnder": {
+		"message": "（最低音が$VALUE$半音足りません）",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"applyRec": {
+		"message": "このキーに"
+	},
+	"loopTitle": {
+		"message": "区間リピート"
+	},
+	"loopFrom": {
+		"message": "ここから"
+	},
+	"loopTo": {
+		"message": "ここまで"
+	},
+	"loopClear": {
+		"message": "区間を消す"
+	},
+	"keyBook": {
+		"message": "キー帳"
+	},
+	"keyBookSub": {
+		"message": "曲ごとのキー"
+	},
+	"songCount": {
+		"message": "$VALUE$曲",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"keyBookAuto": {
+		"message": "曲ごとにキーを覚えて、次に開いたとき自動で戻す"
+	},
+	"keyBookFoot": {
+		"message": "YouTube・TikTok では動画ごと、ほかのサイトではページごとに覚えます。"
+	},
+	"savedSongs": {
+		"message": "保存した曲"
+	},
+	"keyBookEmpty": {
+		"message": "まだありません。オンにしてキーを変えると、ここに自動で追加されます。"
+	},
+	"nowPlaying": {
+		"message": "再生中"
+	},
+	"delete": {
+		"message": "削除"
+	},
+	"done": {
+		"message": "完了"
+	},
+	"formantTitle": {
+		"message": "響きの調整"
+	},
+	"formantKeep": {
+		"message": "そのまま"
+	},
+	"formantThin": {
+		"message": "細く"
+	},
+	"formantThick": {
+		"message": "太く"
+	},
+	"formantFoot": {
+		"message": "歌声が太すぎ・細すぎと感じたときだけ使います。"
+	},
+	"videoTitle": {
+		"message": "映像"
+	},
+	"videoSync": {
+		"message": "映像を音の遅れに合わせる"
+	},
+	"engineTitle": {
+		"message": "軽量モードのエンジン"
+	},
+	"engineFoot": {
+		"message": "ふだんは「標準」がおすすめです。"
+	},
+	"engineR3": {
+		"message": "標準（いちばん自然）"
+	},
+	"engineShort": {
+		"message": "軽い（CPU半分・低音が少し粗い）"
+	},
+	"shortcutsTitle": {
+		"message": "ショートカット（パネルを開かずに操作）"
+	},
+	"scKey": {
+		"message": "キーを上げる / 下げる"
+	},
+	"scBypass": {
+		"message": "元の音と聴き比べ"
+	},
+	"scOpen": {
+		"message": "このパネルを開く"
+	},
+	"scChange": {
+		"message": "変更する"
+	},
+	"rangePageTitle": {
+		"message": "あなたの音域"
+	},
+	"rangeLead": {
+		"message": "登録しておくと、曲ごとに「あなたに合うキー」をおすすめします。"
+	},
+	"rangeLiveHint": {
+		"message": "マイクで測ると、ここに今の声の高さが出ます"
+	},
+	"rangeNotSet": {
+		"message": "まだ登録されていません（下の音域は仮の値です）"
+	},
+	"micStart": {
+		"message": "マイクで測る"
+	},
+	"micStop": {
+		"message": "測定をやめる"
+	},
+	"micError": {
+		"message": "マイクを使えませんでした：$VALUE$",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"reset": {
+		"message": "やり直す"
+	},
+	"step1": {
+		"message": "「マイクで測る」を押して、マイクの使用を許可します。"
+	},
+	"step2": {
+		"message": "楽に出せるいちばん低い声で「あー」と1秒ほど伸ばします。"
+	},
+	"step3": {
+		"message": "少しずつ高くして、無理なく出せるいちばん高い声まで同じように伸ばします。"
+	},
+	"step4": {
+		"message": "下の音域が合っていれば「保存」を押します（手で直すこともできます）。"
+	},
+	"rangeNote": {
+		"message": "カラオケで実際に使う声（ふだんは地声、裏声で歌う曲なら裏声も）で測るのがおすすめです。1秒近く安定して出せた音だけを記録します。"
+	},
+	"registerTitle": {
+		"message": "登録する音域"
+	},
+	"lowNote": {
+		"message": "いちばん低い音"
+	},
+	"highNote": {
+		"message": "いちばん高い音"
+	},
+	"save": {
+		"message": "保存"
+	},
+	"savedMsg": {
+		"message": "保存しました：$VALUE$",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"pickBoth": {
+		"message": "低い音と高い音を選んでください"
+	},
+	"offscreenWhy": {
+		"message": "タブの音を取り込み、キーを変えて再生するため"
+	},
+	"welcomeTitle": {
+		"message": "ようこそ！"
+	},
+	"welcomeLead": {
+		"message": "お気に入りの曲を、あなたのキーで。歌声の響きを保ったままキーを変えるので、同じ歌手がそのまま低く（高く）歌っているように聞こえます。"
+	},
+	"welcomeStep1Title": {
+		"message": "ツールバーにピン留め"
+	},
+	"welcomeStep1": {
+		"message": "右上のパズルのアイコン → 「キー変更」のピンを押すと、いつでもすぐ開けます。"
+	},
+	"welcomeStep2Title": {
+		"message": "動画を再生して「オンにする」"
+	},
+	"welcomeStep2": {
+		"message": "YouTubeやTikTokで曲を再生し、アイコン（または Alt+Shift+K）→「オンにする」。"
+	},
+	"welcomeStep3Title": {
+		"message": "キーを変える"
+	},
+	"welcomeStep3": {
+		"message": "－／＋で半音ずつ。パネルを開かなくても Alt+Shift+↑／↓ で変えられます。「元の音と聴き比べる」ですぐ比べられます。"
+	},
+	"welcomePracticeTitle": {
+		"message": "カラオケの練習に"
+	},
+	"welcomePractice": {
+		"message": "「練習」タブで、歌声を消してカラオケにしたり（0%）、あなたの音域に合うキーを調べたり、サビだけ繰り返したりできます。"
+	},
+	"welcomeRange": {
+		"message": "あなたの音域を登録する"
+	},
+	"welcomeTry": {
+		"message": "YouTubeで試す"
+	},
+	"welcomePrivacy": {
+		"message": "音声はすべてこのパソコンの中で処理され、外部に送られることはありません。"
+	},
+	"keyApplying": {
+		"message": "反映中…"
+	},
+	"keyApplied": {
+		"message": "✓ 反映しました"
+	},
+	"lyricsTiming": {
+		"message": "タイミング調整"
+	},
+	"lyricsSearch": {
+		"message": "歌詞を検索"
+	},
+	"lyricsCollapse": {
+		"message": "たたむ／ひらく"
+	},
+	"lyricsBack": {
+		"message": "再生中の歌詞に戻る"
+	},
+	"lyricsDone": {
+		"message": "完了"
+	},
+	"lyricsEarlier": {
+		"message": "歌詞を早く"
+	},
+	"lyricsLater": {
+		"message": "歌詞を遅く"
+	},
+	"lyricsTapSync": {
+		"message": "今歌っている行をタップして合わせる"
+	},
+	"lyricsTapNow": {
+		"message": "今歌っている行をタップしてください"
+	},
+	"lyricsSongName": {
+		"message": "曲名"
+	},
+	"lyricsArtistName": {
+		"message": "歌手名"
+	},
+	"lyricsSearchBtn": {
+		"message": "検索"
+	},
+	"lyricsLiveTag": {
+		"message": "聞き取り"
+	},
+	"lyricsLiveSub": {
+		"message": "歌詞が見つからないため、歌声をAIで文字にしています"
+	},
+	"lyricsCoverTag": {
+		"message": "カバー"
+	},
+	"lyricsNotFound": {
+		"message": "歌詞が見つかりませんでした"
+	},
+	"lyricsNotFoundHint": {
+		"message": "曲名で探すか、キー変更をオンにするとAIが歌声を聞き取って表示します"
+	},
+	"lyricsListeningHint": {
+		"message": "AIが歌声を聞き取っています…"
+	},
+	"lyricsError": {
+		"message": "歌詞を読み込めませんでした"
+	},
+	"lyricsErrorHint": {
+		"message": "インターネット接続を確認してください"
+	},
+	"lyricsRetry": {
+		"message": "もう一度"
+	},
+	"lyricsHeardTag": {
+		"message": "原曲と違う歌詞"
+	},
+	"lyricsSynced": {
+		"message": "タイミングを合わせました"
+	},
+	"lyricsOffsetZero": {
+		"message": "ずれ補正なし"
+	},
+	"lyricsOffsetEarlier": {
+		"message": "歌詞を $S$秒 早く表示中",
+		"placeholders": {
+			"s": {
+				"content": "$1"
+			}
+		}
+	},
+	"lyricsOffsetLater": {
+		"message": "歌詞を $S$秒 遅く表示中",
+		"placeholders": {
+			"s": {
+				"content": "$1"
+			}
+		}
+	},
+	"lyricsNoResults": {
+		"message": "見つかりませんでした。曲名や歌手名を変えて検索してください"
+	},
+	"lyricsBadgeSynced": {
+		"message": "同期"
+	},
+	"lyricsBadgePlain": {
+		"message": "歌詞のみ"
+	},
+	"lyricsAutoSynced": {
+		"message": "歌声に合わせてタイミングを補正しました"
+	},
+	"lyricsTitle": {
+		"message": "歌詞（YouTube）"
+	},
+	"lyricsShow": {
+		"message": "歌詞を表示"
+	},
+	"lyricsAi": {
+		"message": "AIが歌声を聞き取って補正"
+	},
+	"pageKeyLabel": {
+		"message": "キー"
+	},
+	"pageKeyDown": {
+		"message": "キーを下げる"
+	},
+	"pageKeyUp": {
+		"message": "キーを上げる"
+	},
+	"pageKeyReset": {
+		"message": "元のキーに戻す"
+	},
+	"pageKeyInactive": {
+		"message": "拡張機能のアイコンを一度クリックすると、ここでキーを変えられます"
+	},
+	"lyricsMismatch": {
+		"message": "歌詞が歌と合っていないかもしれません。🔍から選び直せます"
+	},
+	"updTitle": {
+		"message": "アップデート"
+	},
+	"updCheck": {
+		"message": "今すぐ確認"
+	},
+	"updApply": {
+		"message": "更新する"
+	},
+	"updVersions": {
+		"message": "今のバージョン $VALUE$",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"updUnknown": {
+		"message": "確認中…"
+	},
+	"updError": {
+		"message": "更新を確認できませんでした"
+	},
+	"updNotPublished": {
+		"message": "まだ更新が公開されていません。"
+	},
+	"updNeedsFull": {
+		"message": "新しい版 $VALUE$ は、本体の入れ替え（zip の入れ直し）が必要です",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"updAvailable": {
+		"message": "新しい版 $VALUE$ があります",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"updLatest": {
+		"message": "最新の状態です"
+	},
+	"updFolderTitle": {
+		"message": "自動で更新するための準備（1回だけ）"
+	},
+	"updFolderBody": {
+		"message": "拡張機能を読み込んだフォルダ（manifest.json があるフォルダ）を選んでください。ブラウザから許可を求められたら「変更を保存」を許可してください。これで以降は、新しい版が自動でこのパソコンに入ります。"
+	},
+	"updPick": {
+		"message": "フォルダを選ぶ"
+	},
+	"updFolderHint": {
+		"message": "Chrome の仕様で、フォルダを読み込んで入れた拡張機能は、自分のフォルダを自分では書き換えられません。そのため、このフォルダにだけ書き込みを許可します（他のフォルダには触りません）。"
+	},
+	"updNoFolder": {
+		"message": "まだ選んでいません"
+	},
+	"updFolderOk": {
+		"message": "書き込み許可あり"
+	},
+	"updFolderAsk": {
+		"message": "許可が切れています（更新するときに許可を求めます）"
+	},
+	"updPickBlocked": {
+		"message": "このフォルダは選べません。Chrome は、ダウンロード・デスクトップ・ドキュメントそのものなどを選ばせません。拡張機能のフォルダを、それらの中の別のフォルダに置いてから選び直してください。"
+	},
+	"updNoManifest": {
+		"message": "このフォルダに manifest.json がありません。拡張機能を読み込んだフォルダ（manifest.json があるフォルダ）を選んでください。"
+	},
+	"updOtherFolder": {
+		"message": "このフォルダは、今動いている拡張機能のものと違うようです。"
+	},
+	"updFolderSaved": {
+		"message": "フォルダを保存しました。次の更新から自動で入ります。"
+	},
+	"updNeedFolder": {
+		"message": "先に「フォルダを選ぶ」で、拡張機能のフォルダを選んでください。"
+	},
+	"updDenied": {
+		"message": "書き込みが許可されませんでした。"
+	},
+	"updApplying": {
+		"message": "更新しています…"
+	},
+	"updDone": {
+		"message": "バージョン $VALUE$ に更新しました。拡張機能を再読み込みします…（開いている YouTube のページも再読み込みしてください）",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"updFailed": {
+		"message": "更新に失敗しました。"
+	},
+	"updAuto": {
+		"message": "自動で更新する"
+	},
+	"updAutoBody": {
+		"message": "数時間おきに確認し、新しい版があれば、音を処理していないときに自動で入れます。"
+	},
+	"updFoot": {
+		"message": "更新は、署名で本物だと確認できたものだけを入れます。"
+	},
+	"updSection": {
+		"message": "アップデート"
+	},
+	"updAutoShort": {
+		"message": "自動で更新"
+	},
+	"updRowVersion": {
+		"message": "バージョン $VALUE$",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"updRowAvailable": {
+		"message": "新しい版 $VALUE$ があります",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"lyricsSwitched": {
+		"message": "実際に歌っている歌詞に合わせて切り替えました"
+	},
+	"lyricsHeard": {
+		"message": "聞き取った言葉も歌詞に表示（補助）"
+	},
+	"lyricsFoot": {
+		"message": "歌詞は概要欄・コメント欄に書かれた歌詞と、歌詞データベース（LRCLIB、NetEase、QQ Music）から探します。AIの聞き取りはタイミング合わせの補助で、キー変更がオンのときだけ、このパソコンの中で動きます。"
+	},
+	"lyricsAiBadge": {
+		"message": "AIが歌声に合わせています"
+	},
+	"lyricsAiOffHint": {
+		"message": "キー変更をオンにすると、AIが歌声を聞いて自動でタイミングを合わせます"
+	},
+	"lyricsAiOnHint": {
+		"message": "AIが歌声を聞いて自動で合わせています。ずれていたら上のボタンで直せます"
+	},
+	"lyricsAiUserHint": {
+		"message": "手で合わせたタイミングを使っています"
+	},
+	"lyricsFromDescription": {
+		"message": "概要欄"
+	},
+	"lyricsFromComment": {
+		"message": "コメント"
+	},
+	"lyricsEstimated": {
+		"message": "推定タイミング"
+	},
+	"lyricsEstimatedHint": {
+		"message": "歌詞に時刻がないため、AIが歌声を聞いてタイミングを推定しています"
+	},
+	"lyricsPlainSynced": {
+		"message": "歌声に合わせて歌詞を流し始めました"
+	},
+	"pageKeyUpdate": {
+		"message": "更新あり"
+	},
+	"lyricsDiag": {
+		"message": "診断データを保存"
+	},
+	"lyricsDiagHint": {
+		"message": "歌詞のタイミングがずれるときに押すと、その動画での動きを記録したファイルがこのパソコンに保存されます（どこにも送られません）。そのファイルを開発者に渡すと、ずれ方を再現して直せます。"
+	},
+	"lyricsDiagSaved": {
+		"message": "診断データを保存しました"
+	},
+	"lyricsReloadPage": {
+		"message": "拡張機能が新しくなりました。動画を軽く保つため、このページを一度だけ再読み込みしてください。"
+	},
+	"lyricsReloadBtn": {
+		"message": "再読み込み"
+	}
+}

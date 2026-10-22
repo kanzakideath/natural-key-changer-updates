@@ -1,0 +1,778 @@
+{
+	"appName": {
+		"message": "Natural Key Changer – sing it in your key"
+	},
+	"appShort": {
+		"message": "Key Changer"
+	},
+	"appDesc": {
+		"message": "Change the key of any song playing in your browser (YouTube, TikTok…) while keeping the singer's natural voice. Karaoke practice tools included. Everything runs on your computer."
+	},
+	"cmdOpen": {
+		"message": "Open the Key Changer panel"
+	},
+	"cmdKeyUp": {
+		"message": "Key up a semitone"
+	},
+	"cmdKeyDown": {
+		"message": "Key down a semitone"
+	},
+	"cmdBypass": {
+		"message": "Compare with the original (toggle)"
+	},
+	"titleKey": {
+		"message": "Key Changer"
+	},
+	"titlePractice": {
+		"message": "Practice"
+	},
+	"tabKey": {
+		"message": "Key"
+	},
+	"tabPractice": {
+		"message": "Practice"
+	},
+	"powerLabel": {
+		"message": "On/off for this tab"
+	},
+	"settings": {
+		"message": "Settings"
+	},
+	"turnOn": {
+		"message": "Turn on"
+	},
+	"turnOnSub": {
+		"message": "Change the key of this tab's audio"
+	},
+	"turnOnSubOther": {
+		"message": "Running in another tab → switch to this one"
+	},
+	"chipMode": {
+		"message": "Mode"
+	},
+	"chipDelay": {
+		"message": "Delay"
+	},
+	"chipLoad": {
+		"message": "Load"
+	},
+	"modeLight": {
+		"message": "Light"
+	},
+	"modeHq": {
+		"message": "Natural"
+	},
+	"preparing": {
+		"message": "Loading…"
+	},
+	"loadLow": {
+		"message": "Low"
+	},
+	"loadMid": {
+		"message": "Medium"
+	},
+	"loadHigh": {
+		"message": "High"
+	},
+	"seconds": {
+		"message": "$VALUE$ s",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"key": {
+		"message": "Key"
+	},
+	"keyReset": {
+		"message": "Original"
+	},
+	"keyDown": {
+		"message": "Down a semitone"
+	},
+	"keyUp": {
+		"message": "Up a semitone"
+	},
+	"semitones": {
+		"message": "semitones"
+	},
+	"abTitle": {
+		"message": "Compare with the original"
+	},
+	"abTitleOn": {
+		"message": "Playing the original"
+	},
+	"abSub": {
+		"message": "Tap to switch: changed ⇄ original"
+	},
+	"abSubOn": {
+		"message": "Tap to go back to the changed key"
+	},
+	"abSubOff": {
+		"message": "Turn on to use"
+	},
+	"hintLight": {
+		"message": "About 0.1 s delay, light on CPU. Changes the key of the whole song while keeping the voice natural."
+	},
+	"hintHq": {
+		"message": "Recommended. AI separates the voice from the music and treats each on its own – the most natural sound. About 0.7 s delay (video is delayed to match)."
+	},
+	"noticePreparing": {
+		"message": "Getting the AI ready… (playing in Light mode meanwhile)"
+	},
+	"noticeHqUnavailable": {
+		"message": "Natural mode isn't available on this computer, so Light mode is used"
+	},
+	"noticeFallbackUnderrun": {
+		"message": "Your computer couldn't keep up, so it switched to Light mode"
+	},
+	"noticeFallbackError": {
+		"message": "The AI ran into an error, so it switched to Light mode"
+	},
+	"noticeStartFailed": {
+		"message": "Couldn't start on this tab: $VALUE$",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"noticeRestricted": {
+		"message": "Chrome doesn't allow extensions on this page. Open a video site instead."
+	},
+	"noticeNoAudio": {
+		"message": "This tab isn't playing any sound yet – press play and the key will change."
+	},
+	"noticeLoop": {
+		"message": "A-B repeat isn't available on this page"
+	},
+	"noticeNoVideo": {
+		"message": "No video found on this page"
+	},
+	"vocal": {
+		"message": "Vocal volume"
+	},
+	"vocalKaraoke": {
+		"message": "0% (karaoke)"
+	},
+	"choiceKaraoke": {
+		"message": "Karaoke (0%)"
+	},
+	"choiceGuide": {
+		"message": "Guide (30%)"
+	},
+	"choiceFull": {
+		"message": "Full"
+	},
+	"lockedText": {
+		"message": "Available in Natural mode (separates the voice)"
+	},
+	"toHq": {
+		"message": "Use Natural mode"
+	},
+	"rangeTitle": {
+		"message": "Range & best key"
+	},
+	"measureOff": {
+		"message": "Turn on and play to measure"
+	},
+	"measureSaved": {
+		"message": "Saved measurement"
+	},
+	"measureHqOnly": {
+		"message": "Measured in Natural mode"
+	},
+	"measureProgress": {
+		"message": "Measuring… $VALUE$%",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"measureDone": {
+		"message": "Measured ($VALUE$ s of singing)",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"thisSong": {
+		"message": "Song"
+	},
+	"you": {
+		"message": "You"
+	},
+	"notSet": {
+		"message": "Not set"
+	},
+	"register": {
+		"message": "Set up"
+	},
+	"edit": {
+		"message": "Edit"
+	},
+	"recNeedVoice": {
+		"message": "Set up your vocal range to get a key suggestion"
+	},
+	"recNeedSong": {
+		"message": "Play the song in Natural mode to get a key suggestion"
+	},
+	"recCurrent": {
+		"message": "The current key $VALUE$ suits you",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"recSuggest": {
+		"message": "Best for you: $VALUE$",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"recOver": {
+		"message": "(top note $VALUE$ semitones above your range)",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"recUnder": {
+		"message": "(lowest note $VALUE$ semitones below your range)",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"applyRec": {
+		"message": "Use it"
+	},
+	"loopTitle": {
+		"message": "A-B repeat"
+	},
+	"loopFrom": {
+		"message": "From"
+	},
+	"loopTo": {
+		"message": "To"
+	},
+	"loopClear": {
+		"message": "Clear the section"
+	},
+	"keyBook": {
+		"message": "Key book"
+	},
+	"keyBookSub": {
+		"message": "Your key for each song"
+	},
+	"songCount": {
+		"message": "$VALUE$ songs",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"keyBookAuto": {
+		"message": "Remember the key of each song and restore it next time"
+	},
+	"keyBookFoot": {
+		"message": "YouTube and TikTok: per video. Other sites: per page."
+	},
+	"savedSongs": {
+		"message": "Saved songs"
+	},
+	"keyBookEmpty": {
+		"message": "Nothing yet. Turn it on and change the key – songs are added here automatically."
+	},
+	"nowPlaying": {
+		"message": "Playing"
+	},
+	"delete": {
+		"message": "Delete"
+	},
+	"done": {
+		"message": "Done"
+	},
+	"formantTitle": {
+		"message": "Voice character"
+	},
+	"formantKeep": {
+		"message": "Natural"
+	},
+	"formantThin": {
+		"message": "Thinner"
+	},
+	"formantThick": {
+		"message": "Deeper"
+	},
+	"formantFoot": {
+		"message": "Only if the voice sounds too deep or too thin."
+	},
+	"videoTitle": {
+		"message": "Video"
+	},
+	"videoSync": {
+		"message": "Delay the video to match the audio"
+	},
+	"engineTitle": {
+		"message": "Light mode engine"
+	},
+	"engineFoot": {
+		"message": "\"Standard\" is recommended."
+	},
+	"engineR3": {
+		"message": "Standard (most natural)"
+	},
+	"engineShort": {
+		"message": "Lighter (half the CPU, slightly rougher bass)"
+	},
+	"shortcutsTitle": {
+		"message": "Shortcuts (without opening the panel)"
+	},
+	"scKey": {
+		"message": "Key up / down"
+	},
+	"scBypass": {
+		"message": "Compare with the original"
+	},
+	"scOpen": {
+		"message": "Open this panel"
+	},
+	"scChange": {
+		"message": "Change"
+	},
+	"rangePageTitle": {
+		"message": "Your vocal range"
+	},
+	"rangeLead": {
+		"message": "Once set, every song gets a key suggestion that fits your voice."
+	},
+	"rangeLiveHint": {
+		"message": "Measure with the mic to see your pitch here"
+	},
+	"rangeNotSet": {
+		"message": "Not set yet (the range below is just an example)"
+	},
+	"micStart": {
+		"message": "Measure with mic"
+	},
+	"micStop": {
+		"message": "Stop"
+	},
+	"micError": {
+		"message": "Couldn't use the microphone: $VALUE$",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"reset": {
+		"message": "Start over"
+	},
+	"step1": {
+		"message": "Press \"Measure with mic\" and allow the microphone."
+	},
+	"step2": {
+		"message": "Sing \"ahh\" for about a second on the lowest note you can sing comfortably."
+	},
+	"step3": {
+		"message": "Go up step by step to the highest note you can sing without straining."
+	},
+	"step4": {
+		"message": "If the range below looks right, press Save (you can also adjust it by hand)."
+	},
+	"rangeNote": {
+		"message": "Use the voice you actually sing with (include falsetto if you use it). Only notes held steadily for about a second are recorded."
+	},
+	"registerTitle": {
+		"message": "Range to save"
+	},
+	"lowNote": {
+		"message": "Lowest note"
+	},
+	"highNote": {
+		"message": "Highest note"
+	},
+	"save": {
+		"message": "Save"
+	},
+	"savedMsg": {
+		"message": "Saved: $VALUE$",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"pickBoth": {
+		"message": "Choose the lowest and highest notes"
+	},
+	"offscreenWhy": {
+		"message": "To capture the tab's audio and play it back in another key"
+	},
+	"welcomeTitle": {
+		"message": "Welcome!"
+	},
+	"welcomeLead": {
+		"message": "Your favourite songs, in your key. The voice keeps its natural character, so it sounds like the same singer simply singing lower or higher."
+	},
+	"welcomeStep1Title": {
+		"message": "Pin it to the toolbar"
+	},
+	"welcomeStep1": {
+		"message": "Click the puzzle icon at the top right, then the pin next to Key Changer."
+	},
+	"welcomeStep2Title": {
+		"message": "Play a video and turn it on"
+	},
+	"welcomeStep2": {
+		"message": "Play a song on YouTube, TikTok or any site, click the icon (or Alt+Shift+K) and press \"Turn on\"."
+	},
+	"welcomeStep3Title": {
+		"message": "Change the key"
+	},
+	"welcomeStep3": {
+		"message": "Use – / + one semitone at a time, or Alt+Shift+↑ / ↓ without opening the panel. \"Compare with the original\" switches back and forth instantly."
+	},
+	"welcomePracticeTitle": {
+		"message": "For karaoke practice"
+	},
+	"welcomePractice": {
+		"message": "The Practice tab can remove the vocals (karaoke), suggest the key that fits your voice, and loop a section."
+	},
+	"welcomeRange": {
+		"message": "Set up your vocal range"
+	},
+	"welcomeTry": {
+		"message": "Try it on YouTube"
+	},
+	"welcomePrivacy": {
+		"message": "All audio is processed on this computer and never sent anywhere."
+	},
+	"keyApplying": {
+		"message": "Applying…"
+	},
+	"keyApplied": {
+		"message": "✓ Applied"
+	},
+	"lyricsTiming": {
+		"message": "Timing"
+	},
+	"lyricsSearch": {
+		"message": "Find lyrics"
+	},
+	"lyricsCollapse": {
+		"message": "Collapse / expand"
+	},
+	"lyricsBack": {
+		"message": "Back to the current line"
+	},
+	"lyricsDone": {
+		"message": "Done"
+	},
+	"lyricsEarlier": {
+		"message": "Lyrics earlier"
+	},
+	"lyricsLater": {
+		"message": "Lyrics later"
+	},
+	"lyricsTapSync": {
+		"message": "Tap the line being sung to sync"
+	},
+	"lyricsTapNow": {
+		"message": "Tap the line being sung now"
+	},
+	"lyricsSongName": {
+		"message": "Song"
+	},
+	"lyricsArtistName": {
+		"message": "Artist"
+	},
+	"lyricsSearchBtn": {
+		"message": "Search"
+	},
+	"lyricsLiveTag": {
+		"message": "Heard"
+	},
+	"lyricsLiveSub": {
+		"message": "No lyrics found: AI is transcribing the vocals"
+	},
+	"lyricsCoverTag": {
+		"message": "Cover"
+	},
+	"lyricsNotFound": {
+		"message": "No lyrics found"
+	},
+	"lyricsNotFoundHint": {
+		"message": "Search by title, or turn on the key changer and AI will transcribe the vocals"
+	},
+	"lyricsListeningHint": {
+		"message": "AI is listening to the vocals…"
+	},
+	"lyricsError": {
+		"message": "Couldn’t load lyrics"
+	},
+	"lyricsErrorHint": {
+		"message": "Check your internet connection"
+	},
+	"lyricsRetry": {
+		"message": "Try again"
+	},
+	"lyricsHeardTag": {
+		"message": "Changed lyrics"
+	},
+	"lyricsSynced": {
+		"message": "Timing synced"
+	},
+	"lyricsOffsetZero": {
+		"message": "No offset"
+	},
+	"lyricsOffsetEarlier": {
+		"message": "Lyrics shown $S$ s earlier",
+		"placeholders": {
+			"s": {
+				"content": "$1"
+			}
+		}
+	},
+	"lyricsOffsetLater": {
+		"message": "Lyrics shown $S$ s later",
+		"placeholders": {
+			"s": {
+				"content": "$1"
+			}
+		}
+	},
+	"lyricsNoResults": {
+		"message": "Nothing found. Try a different title or artist"
+	},
+	"lyricsBadgeSynced": {
+		"message": "Synced"
+	},
+	"lyricsBadgePlain": {
+		"message": "Text only"
+	},
+	"lyricsAutoSynced": {
+		"message": "Timing corrected to the vocals"
+	},
+	"lyricsTitle": {
+		"message": "Lyrics (YouTube)"
+	},
+	"lyricsShow": {
+		"message": "Show lyrics"
+	},
+	"lyricsAi": {
+		"message": "Let AI listen and correct timing"
+	},
+	"pageKeyLabel": {
+		"message": "Key"
+	},
+	"pageKeyDown": {
+		"message": "Lower the key"
+	},
+	"pageKeyUp": {
+		"message": "Raise the key"
+	},
+	"pageKeyReset": {
+		"message": "Back to the original key"
+	},
+	"pageKeyInactive": {
+		"message": "Click the extension icon once, and you can change the key here"
+	},
+	"lyricsMismatch": {
+		"message": "These lyrics may not match what is sung. Pick another with the search button"
+	},
+	"updTitle": {
+		"message": "Updates"
+	},
+	"updCheck": {
+		"message": "Check now"
+	},
+	"updApply": {
+		"message": "Update now"
+	},
+	"updVersions": {
+		"message": "Installed version $VALUE$",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"updUnknown": {
+		"message": "Checking…"
+	},
+	"updError": {
+		"message": "Could not check for updates"
+	},
+	"updNotPublished": {
+		"message": "No update has been published yet."
+	},
+	"updNeedsFull": {
+		"message": "Version $VALUE$ needs a new full download (the models changed)",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"updAvailable": {
+		"message": "Version $VALUE$ is available",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"updLatest": {
+		"message": "You are up to date"
+	},
+	"updFolderTitle": {
+		"message": "Set up automatic updates (once)"
+	},
+	"updFolderBody": {
+		"message": "Choose the folder you loaded the extension from (the one with manifest.json). When the browser asks, allow it to save changes. After that, new versions are installed on this computer by themselves."
+	},
+	"updPick": {
+		"message": "Choose folder"
+	},
+	"updFolderHint": {
+		"message": "Chrome does not let an extension loaded from a folder change its own folder. So only this folder is made writable (nothing else is touched)."
+	},
+	"updNoFolder": {
+		"message": "Not chosen yet"
+	},
+	"updFolderOk": {
+		"message": "writing allowed"
+	},
+	"updFolderAsk": {
+		"message": "permission expired (it is asked for when updating)"
+	},
+	"updPickBlocked": {
+		"message": "Chrome does not allow this folder (Downloads, Desktop or Documents themselves, system folders). Put the extension in a folder inside one of those and choose again."
+	},
+	"updNoManifest": {
+		"message": "There is no manifest.json in this folder. Choose the folder the extension was loaded from."
+	},
+	"updOtherFolder": {
+		"message": "This does not look like the folder of the extension that is running."
+	},
+	"updFolderSaved": {
+		"message": "Folder saved. The next update will install by itself."
+	},
+	"updNeedFolder": {
+		"message": "Choose the extension folder first."
+	},
+	"updDenied": {
+		"message": "Writing was not allowed."
+	},
+	"updApplying": {
+		"message": "Updating…"
+	},
+	"updDone": {
+		"message": "Updated to version $VALUE$. Reloading the extension… (reload open YouTube pages, too)",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"updFailed": {
+		"message": "The update failed."
+	},
+	"updAuto": {
+		"message": "Update automatically"
+	},
+	"updAutoBody": {
+		"message": "Checks every few hours and installs a new version when nothing is being processed."
+	},
+	"updFoot": {
+		"message": "Only updates whose signature checks out are installed."
+	},
+	"updSection": {
+		"message": "Updates"
+	},
+	"updAutoShort": {
+		"message": "Update automatically"
+	},
+	"updRowVersion": {
+		"message": "Version $VALUE$",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"updRowAvailable": {
+		"message": "Version $VALUE$ is available",
+		"placeholders": {
+			"value": {
+				"content": "$1"
+			}
+		}
+	},
+	"lyricsSwitched": {
+		"message": "Switched to the lyrics that are being sung"
+	},
+	"lyricsHeard": {
+		"message": "Also show words the AI heard (helper)"
+	},
+	"lyricsFoot": {
+		"message": "Lyrics come from the video's description and comments and from lyrics databases (LRCLIB, NetEase, QQ Music). The AI only helps with the timing, listening while the key changer is on, entirely on this computer."
+	},
+	"lyricsAiBadge": {
+		"message": "AI is following the vocals"
+	},
+	"lyricsAiOffHint": {
+		"message": "Turn the key changer on and AI will sync the lyrics to the vocals automatically"
+	},
+	"lyricsAiOnHint": {
+		"message": "AI is syncing the lyrics to the vocals. If they are off, adjust them above"
+	},
+	"lyricsAiUserHint": {
+		"message": "Using the timing you set"
+	},
+	"lyricsFromDescription": {
+		"message": "Description"
+	},
+	"lyricsFromComment": {
+		"message": "Comment"
+	},
+	"lyricsEstimated": {
+		"message": "Estimated timing"
+	},
+	"lyricsEstimatedHint": {
+		"message": "These lyrics have no times: AI estimates the timing from the vocals"
+	},
+	"lyricsPlainSynced": {
+		"message": "Lyrics now follow the vocals"
+	},
+	"pageKeyUpdate": {
+		"message": "Update"
+	},
+	"lyricsDiag": {
+		"message": "Save diagnostics"
+	},
+	"lyricsDiagHint": {
+		"message": "When the lyrics are off, press this: a file recording what happened for this video is saved on this computer (nothing is sent). Hand it to the developer to reproduce and fix the timing."
+	},
+	"lyricsDiagSaved": {
+		"message": "Diagnostics saved"
+	},
+	"lyricsReloadPage": {
+		"message": "The extension was updated. Reload this page once to keep the video smooth."
+	},
+	"lyricsReloadBtn": {
+		"message": "Reload"
+	}
+}
