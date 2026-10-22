@@ -1,0 +1,493 @@
+// Finding the lyrics of what is playing: turns YouTube metadata (title, channel, music
+// attribution in the description, duration) into candidate (song, artist) pairs, searches
+// LRCLIB with them and scores the results.
+//
+// Handles the usual title shapes:
+//   Artist - Song (Official Video) / Artist「Song」MV / 【MV】Song / Artist / Song - Artist
+//   【歌ってみた】Song / Original artist (covered by X) / Song - X (cover) / THE FIRST TAKE ...
+(function (root) {
+	const KCL = (root.KCL = root.KCL || {});
+	const { titleSim, compact } = KCL;
+
+	// words that describe the video, not the song
+	const NOISE = [
+		'official music video', 'official video', 'official mv', 'official audio', 'official lyric video', 'official visualizer',
+		'music video', 'lyric video', 'lyrics video', 'lyrics', 'lyric', 'audio', 'visualizer', 'video', 'mv', 'pv', 'm/v',
+		'full ver', 'full version', 'full', 'short ver', 'tv size', 'tv ver', 'hd', '4k', 'hq', 'hi-res', 'remastered', 'remaster',
+		'the first take', 'first take', 'live', 'live ver', 'live video', 'live at', 'acoustic ver', 'official', 'teaser', 'trailer',
+		'歌ってみた', 'うたってみた', '弾き語り', '弾いてみた', '叩いてみた', '踊ってみた', 'カバー', 'cover', 'covered by', 'covered',
+		'公式', 'オフィシャル', 'オリジナル曲', 'オリジナルソング', 'original song', 'オリジナルmv', 'ミュージックビデオ', '歌詞付き', '歌詞', 'フル', 'ライブ', '映像', '中文字幕', 'subbed', 'sub', 'eng sub',
+		'english sub', 'romaji', 'with lyrics', 'karaoke', 'カラオケ', 'off vocal', 'instrumental', 'remix', 'nightcore', 'sped up', 'slowed',
+		'オルゴール', 'music box', 'piano cover', 'ピアノカバー', 'piano ver', 'piano arrange', 'acoustic cover', 'band ver', 'orchestra ver', 'lo-fi remix', 'lofi', 'lo-fi', 'shorts', 'ai cover', '合唱', 'アカペラ', 'a cappella', '女性が歌う', '男性が歌う', 'ガイドメロディあり', 'ガイドメロディ', 'ピアノ弾き語り', 'ピアノ', '歌枠切り抜き', '歌枠', '切り抜き', '歌枠より', 'english ver', 'english version', 'japanese ver', 'tv size ver',
+		// Korean / Chinese uploads of Japanese songs
+		'현장음', '가사', '해석', '번역', '자막', '한글자막', '한국어 자막', '한국어 번역', '발음', '커버', '노래', '불러보았다', '불러봤다', '불러봤어요', '라이브', '어쿠스틱 버전', '어쿠스틱', '버전', '풀버전', '뮤직비디오', '뮤비', '공식',
+		'中字', '中日字幕', '中文翻譯', '中文翻译', '动态歌词', '動態歌詞', '歌词', '翻唱', '日文歌詞', '中日歌詞', '中日歌词',
+	];
+	const COVER = /(歌ってみた|うたってみた|弾き語り|cover|カバー|covered|弾いてみた|커버|불러보았다|불러봤|翻唱)/i;
+	const LIVE = /(\blive\b|ライブ|the first take|弾き語り|acoustic|라이브|현장음|어쿠스틱)/i;
+	const ARRANGE = /(remix|arrange|アレンジ|ver\.|version|edit|nightcore|sped up|slowed|acoustic|piano|버전|어쿠스틱)/i;
+
+	function stripNoise(s) {
+		let t = ` ${s} `;
+		for (const w of NOISE.slice().sort((a, b) => b.length - a.length)) {
+			t = t.replace(new RegExp(`(^|[\\s\\[\\(【（『「/|｜:：・_-])${w.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}(?=$|[\\s\\]\\)】）』」/|｜:：・_-])`, 'gi'), '$1 ');
+		}
+		return t.replace(/\s+/g, ' ').trim();
+	}
+
+	// "春猿火 -Harusaruhi-" -> 春猿火; "Ado Official Channel" -> Ado; "YOASOBI - Topic" -> YOASOBI
+	function cleanArtist(s) {
+		if (!s) return '';
+		let a = s
+			.replace(/\s*-\s*topic$/i, '')
+			.replace(/\bvevo$/i, '')
+			.replace(/(official\s*)?(youtube\s*)?(channel|ch\.?)$/i, '')
+			.replace(/(公式)?(チャンネル|ちゃんねる)$/, '')
+			.replace(/(^|\s)official(?=\s|$)/gi, ' ')
+			.replace(/\s*[-‐−–~〜]\s*[A-Za-z][\w .'-]*[-‐−–~〜]\s*$/, '') // latin alias between dashes
+			.replace(/\s*[(（][^)）]*[)）]\s*$/, '')
+			.trim();
+		return a || s.trim();
+	}
+
+	const unique = (arr) => {
+		const seen = new Set();
+		return arr.filter((x) => {
+			const k = compact(x);
+			if (!k || seen.has(k)) return false;
+			seen.add(k);
+			return true;
+		});
+	};
+
+	const splitArtists = (a) => a.split(/\s*[,、&＆×]\s*|\s+x\s+|\s+(?:feat|ft)\.?\s+/i).map((x) => x.trim()).filter(Boolean);
+	const noFeat = (p) => p.replace(/\s*[(（]?\s*(?:feat\.|ft\.|feat\s|featuring\s).*$/i, '').replace(/\s*ver\.\s*\S+$/i, '').trim();
+
+	// "米津玄師 Kenshi Yonezu" / "藤井 風(Fujii Kaze)": each script separately as well
+	function scriptVariants(a) {
+		const out = [a];
+		const jp = a.match(/[぀-ヿ㐀-鿿々][぀-ヿ㐀-鿿々\s]*/g);
+		const lat = a.match(/[A-Za-z][A-Za-z.'*\s]*[A-Za-z.*]/g);
+		if (jp && lat) out.push(...jp.map((x) => x.trim()), ...lat.map((x) => x.trim()));
+		return out;
+	}
+
+	// Candidate (song, artist) pairs from a video title, with a prior for each reading.
+	// "Song at CREAM PUFF LIVE 3", "Song @ Budokan", "Song live at …", "Song (2024 ver.)": the
+	// song without the event (kept as an extra reading; "Love from the Other Side" is a song)
+	function withoutEvent(title) {
+		return title
+			// (not inside a quoted title: "「Alice in N.Y.」")
+			.replace(/\s+(?:live\s+)?(?:at|@|from)\s+[^\-–—/|｜【\[(（「『」』]{2,60}?(?=\s*(?:[\-–—/|｜【\[(（]|$))/i, ' ')
+			// "in" only before something that is clearly an event / a place to play
+			.replace(/\s+(?:live\s+)?in\s+(?=[^「『」』]*(?:live|concert|tour|festival|fes\b|arena|dome|hall|budokan|stadium|session|studio|\d{4}))[^\-–—/|｜【\[(（「『」』]{2,60}?(?=\s*(?:[\-–—/|｜【\[(（]|$))/i, ' ')
+			.replace(/\s*[\[(（【]?\s*(?:\d{4}\s*)?(?<![a-z])(?:ver(?:sion)?\.?|edit|mix)\s*[\])）】]?\s*$/i, ' ')
+			.replace(/\s+/g, ' ')
+			.trim();
+	}
+
+	function parseVideo(meta) {
+		const base = parseVideoOne(meta);
+		base.raw = (meta.title || '').normalize('NFKC');
+		const alt = withoutEvent((meta.title || '').normalize('NFKC'));
+		if (!alt || alt === base.raw.trim()) return base;
+		const other = parseVideoOne({ ...meta, title: alt });
+		const seen = new Set(base.pairs.map((p) => compact(p.title) + '|' + compact(p.artist)));
+		for (const p of other.pairs) if (!seen.has(compact(p.title) + '|' + compact(p.artist))) base.pairs.push({ ...p, prior: p.prior + 0.05 });
+		base.pairs.sort((x, y) => y.prior - x.prior);
+		base.titles = unique(base.pairs.map((p) => p.title));
+		base.artists = unique(base.pairs.map((p) => p.artist).filter(Boolean));
+		return base;
+	}
+
+	function parseVideoOne({ title = '', channel = '', music = null, extra = null }) {
+		title = title.normalize('NFKC');
+		channel = channel.normalize('NFKC');
+		// the event / venue clause of a live video ("[Live at 'No title' in NIPPON BUDOKAN]",
+		// "(Live at Budokan 2023)"): the concert's name is not a song
+		const liveWords = title;
+		title = title.replace(/[\[\(（【]\s*(?:live|concert|tour|ライブ|コンサート|ツアー|festival|fes\b|@)[^\]\)）】]*[\]\)）】]/gi, ' ').replace(/\s+/g, ' ').trim() || title;
+		const channelIsNoise = !stripNoise(channel.toLowerCase()).replace(/\s/g, '');
+		const isCover = COVER.test(title) || /歌ってみた|cover/i.test(channel);
+		const isLive = LIVE.test(liveWords);
+		const isArrange = ARRANGE.test(title);
+		const pairs = []; // {title, artist, prior}
+		const coverers = [];
+		const chan = channelIsNoise ? '' : cleanArtist(channel);
+		const add = (t, a, prior) => {
+			t = noFeat(stripNoise((t || '').replace(/\u2215/g, '/')));
+			a = (a || '').replace(/\u2215/g, '/');
+			if (!t || t.length > 80) return;
+			const arts = a ? splitArtists(cleanArtist(stripNoise(a))).flatMap(scriptVariants).map((x) => (/[\p{L}\p{N}]/u.test(x) && !/^(ver|version)\.?$/i.test(x) ? x : '')) : [''];
+			for (const x of arts) pairs.push({ title: t, artist: x, prior });
+		};
+
+		// YouTube's own match is good evidence when the title agrees; it can also name another
+		// song of the same singer for a cover, or be the previous video's: weaker then
+		if (music && music.title) {
+			const mt = compact(noFeat(stripNoise(music.title)));
+			const agrees = mt && compact(title).includes(mt);
+			const before = pairs.length;
+			add(music.title, music.artist || '', agrees ? 1.2 : 0.45);
+			// (disagreeing: a match through it has to beat the title's own readings clearly)
+			if (!agrees) for (let i = before; i < pairs.length; ++i) pairs[i].penalty = 0.7;
+		}
+		// credits in the description ("原曲：Song / Artist", "作詞作曲：…")
+		if (extra) {
+			for (const sg of extra.songs || []) {
+				for (const ar of extra.artists || []) add(sg, ar, 1.1);
+				add(sg, '', 0.9);
+			}
+		}
+
+		// "Song ver.XYZ": the version of XYZ (a group / singer) — likely in the database as such
+		const verOf = /(?<![a-z])ver(?:sion)?\.?\s*([A-Za-z0-9][\w.&×x\- ]{0,24}?|[^\s【】\[\]()（）]{2,20})\s*(?=[【\[(（]|$)/i.exec(title);
+		const verOwner = verOf && !/^(full|short|tv|mv|pv|live|acoustic|piano|band|english|japanese|remix|\d+(\.\d+)?)$/i.test(verOf[1].trim()) ? verOf[1].trim() : '';
+		// "괴수의 꽃노래(怪獣の花唄)": a translated title with the original in brackets
+		for (const m of title.matchAll(/([^()（）\[\]【】]{2,60})[(（]([^()（）]{1,40})[)）]/g)) {
+			const outer = m[1], inner = m[2].trim();
+			if (KCL.hasJapanese(inner) && !KCL.hasJapanese(outer.replace(/[\u4e00-\u9fff]/g, '')) && !/[ぁ-ゟ゠-ヿ]/.test(outer)) add(inner, '', 0.95);
+		}
+		// "covered by X" / "Covered by X" / "歌ってみた by X"
+		for (const m of title.matchAll(/(?:covered\s*by|cover\s*by|歌ってみた\s*by|cover[:：])\s*([^\]】)）/|｜#]+)/gi)) coverers.push(m[1].trim());
+		if (isCover && chan) coverers.push(chan);
+
+		// quoted 「Song」, with the artist before it ("Artist「Song」") or the channel
+		for (const m of title.matchAll(/[「『“"]([^」』”"]{1,60})[」』”"]|(?:^|\s)['‘]([^'’]{2,60})['’](?=\s|$)/g)) {
+			if (m[1] === undefined) m[1] = m[2];
+			// "Live at 'No title'", "in \"Name\"": where it was sung, not what
+			if (/(?:\b(?:at|in|from|tour|live|concert)|@|ライブ|ツアー)\s*$/i.test(title.slice(0, m.index))) continue;
+			const before = title.slice(0, m.index).replace(/#\S+/g, ' ').replace(/[【\[（(][^】\])）]*[】\]）)]/g, ' ');
+			if (stripNoise(before)) add(m[1], before, 1.0);
+			add(m[1], chan, 0.9);
+			add(m[1], '', 0.6);
+		}
+
+		// strip bracketed noise ("【MV】"), keep bracketed song names ("【Song】")
+		const brackets = [];
+		let rest = title.replace(/[「『“"]([^」』”"]*)[」』”"]/g, ' | $1 | ').replace(/(^|\s)['‘]([^'’]{2,60})['’](?=\s|$)/g, '$1 | $2 | ');
+		rest = rest.replace(/[【\[（(]([^】\])）]*)[】\]）)]/g, (m, inner) => {
+			brackets.push(inner);
+			return ' | ';
+		});
+		rest = rest.replace(/#\S+/g, ' ');
+		// names with slashes are not separators: "W/X/Y", "AC/DC"
+		rest = rest.replace(/(^|[^\w/])((?:[A-Za-z0-9]{1,3}\/){1,3}[A-Za-z0-9]{1,3})(?=$|[^\w/])/g, (m, p, name) => p + name.replace(/\//g, '\u2215'));
+		// split, remembering the separator between neighbours
+		const tokens = rest.split(/(\s+[-‐−–—~〜]\s+|\s*[/／|｜]\s*|(?<!\d)\s*[:：]\s*(?!\d))/);
+		const parts = [];
+		for (let i = 0; i < tokens.length; i += 2) {
+			const text = noFeat(stripNoise(tokens[i]).replace(/^[-‐−–—~〜:：\s]+|[-‐−–—~〜:：\s]+$/g, ''));
+			const sep = i > 0 ? tokens[i - 1].trim() : '';
+			if (text && !/^(feat|ft)\.?/i.test(text)) parts.push({ text, sep });
+			else if (parts.length && sep) parts[parts.length - 1].sepAfterGap = true;
+		}
+		// a part that is the channel's name is the artist, whatever the order
+		const isChan = (x) => chan && titleSim(x, chan) >= 0.85;
+		for (let i = 0; i < parts.length; ++i) {
+			const a = parts[i], b = parts[i + 1];
+			if (b && (isChan(a.text) || isChan(b.text))) {
+				const [song, artist] = isChan(b.text) ? [a.text, b.text] : [b.text, a.text];
+				add(song, artist, 1.0);
+				add(song, '', 0.5);
+				continue;
+			}
+			if (b) {
+				const sep = b.sep;
+				if (/[-‐−–—~〜]/.test(sep)) {
+					add(b.text, a.text, 0.8); // Artist - Song
+					add(a.text, b.text, 0.35);
+				} else if (/[/／]/.test(sep)) {
+					add(a.text, b.text, 0.8); // Song / Artist (Japanese convention)
+					add(b.text, a.text, 0.45);
+				} else if (/[:：]/.test(sep)) {
+					add(b.text, a.text, 0.7); // Artist: Song
+					add(a.text, b.text, 0.3);
+				} else {
+					add(a.text, b.text, 0.4);
+					add(b.text, a.text, 0.4);
+				}
+			}
+			add(a.text, chan, parts.length === 1 ? 0.85 : 0.5);
+			add(a.text, '', 0.3);
+			// "Lemon 米津玄師": a song and an artist in different scripts, without a separator
+			const lat = a.text.match(/^([A-Za-z][\w .'!?&-]*?)\s+([\u3040-\u30ff\u3400-\u9fff][^A-Za-z]*)$/) || a.text.match(/^([\u3040-\u30ff\u3400-\u9fff][^A-Za-z]*?)\s+([A-Za-z][\w .'!?&-]*)$/);
+			if (lat) {
+				add(lat[1], lat[2], 0.5);
+				add(lat[2], lat[1], 0.5);
+			}
+			// "千本桜 まふまふ" / "Song Artist": try the first word(s) as the song
+			const words = a.text.split(/\s+/);
+			if (words.length === 2) {
+				add(words[0], words[1], 0.3);
+				add(words[0], '', 0.25);
+			}
+		}
+		for (const b of brackets) {
+			const c = stripNoise(b);
+			if (c && c.length <= 40) {
+				// "Song (Artist)" is the usual reading in covers; the bracket as the song is a
+				// fallback ("【Song】")
+				for (const p of parts) if (compact(p.text) !== compact(c)) add(p.text, c, 0.6);
+				add(c, chan, 0.3);
+				add(c, '', 0.2);
+			}
+		}
+		// (named in the title itself: before what the description says about the original)
+		if (verOwner) for (const t of unique(pairs.slice(0, 4).map((p) => p.title))) add(t, verOwner, 1.25);
+		// the original video linked from the description: its title, read the same way
+		if (extra && extra.videos) {
+			for (const v of extra.videos.slice(0, 2)) for (const p of parseVideoOne({ title: v.title || '', channel: v.channel || '' }).pairs.slice(0, 4)) pairs.push({ ...p, prior: Math.min(1.1, p.prior + 0.1) });
+		}
+		// credits naming only the writer ("作詞作曲：ハチ", a Topic channel's "Composer:"): each
+		// reading of the title with that artist
+		if (extra && !(extra.songs || []).length) {
+			for (const ar of (extra.artists || []).slice(0, 3)) for (const t of unique(pairs.slice(0, 6).map((p) => p.title))) add(t, ar, 1.0);
+		}
+		// feat. artists as alternatives
+		const feats = [...title.matchAll(/(?:feat|ft)\.?\s*([^)）\]】/|｜]+)/gi)].map((m) => m[1].trim());
+		for (const p of pairs.slice()) for (const f of feats) if (p.artist) pairs.push({ ...p, artist: f, prior: p.prior - 0.2 });
+
+		// the person covering the song is not its artist
+		const coverKeys = coverers.flatMap(splitArtists).map(compact).filter(Boolean);
+		const isCoverer = (x) => x && coverKeys.some((k) => compact(x) === k || (k.length >= 3 && compact(x).includes(k)));
+		const seen = new Map();
+		for (const p of pairs) {
+			if (isCoverer(p.artist)) p.artist = '';
+			if (isCoverer(p.title)) {
+				// "千本桜 ver.まふまふ": take the coverer out instead of dropping the reading
+				let t = p.title;
+				for (const k of coverers.flatMap(splitArtists)) if (k) t = t.replace(k, ' ');
+				t = noFeat(stripNoise(t)).replace(/\s+/g, ' ').trim();
+				if (!t || isCoverer(t)) continue;
+				p.title = t;
+			}
+			const k = compact(p.title) + '\u0000' + compact(p.artist);
+			if (!seen.has(k) || seen.get(k).prior < p.prior) seen.set(k, p);
+		}
+		const ranked = [...seen.values()].sort((a, b) => b.prior - a.prior);
+		return {
+			pairs: ranked,
+			titles: unique(ranked.map((p) => p.title)),
+			artists: unique(ranked.map((p) => p.artist).filter(Boolean)),
+			coverers: unique(coverers),
+			isCover,
+			isLive,
+			isArrange,
+		};
+	}
+
+	// Score one LRCLIB record against the parsed video. Higher is better; >~1.2 is a confident match.
+	// A Japanese (kana) / Korean title over lyrics with none of that script: the lyrics of
+	// another language (a translation, an English cover of the song, a comment written for
+	// readers abroad). Not when the title itself says it is in English.
+	function langMismatch(title, lyrics) {
+		const t = String(title || ''), l = String(lyrics || '').slice(0, 3000);
+		if (!l.trim() || /english|英語|\beng\b|en\s*ver|englis|영어/i.test(t)) return false;
+		const letters = (re) => (l.match(re) || []).length;
+		const total = letters(/[\p{L}]/gu) || 1;
+		if (/[\u3040-\u30ff]/.test(t)) return letters(/[\u3040-\u30ff\u4e00-\u9fff]/g) / total < 0.1;
+		if (/[\uac00-\ud7af]/.test(t) && !/[\u3040-\u30ff]/.test(t)) return letters(/[\uac00-\ud7af]/g) / total < 0.1 && letters(/[\u3040-\u30ff\u4e00-\u9fff]/g) / total < 0.1;
+		return false;
+	}
+
+	const VERSION = /(\blive\b|ライブ|remix|\bedit\b|\bver\b|version|acoustic|instrumental|karaoke|off vocal|\binst\b|tv size|short|remaster|sped up|slowed|nightcore)/i;
+	// assumeSynced: a record whose lyrics are not fetched yet (other databases), scored as if
+	// it had timed lyrics
+	function score(rec, parsed, duration, assumeSynced = false) {
+		const track = rec.trackName || '', artist = rec.artistName || '';
+		// other names of the song / the singer the database knows ("うみろ" = "こじろー")
+		const tracks = [track, ...(rec.trackAliases || [])].filter(Boolean);
+		const artists = [artist, ...(artist.includes(',') ? artist.split(/\s*,\s*/) : []), ...(rec.artistAliases || [])].filter(Boolean);
+		let best = -1, ts = 0, as = 0;
+		for (const p of parsed.pairs) {
+			const x = Math.max(...tracks.map((t) => titleSim(t, p.title)));
+			if (x < 0.4) continue;
+			const y = p.artist ? Math.max(...artists.map((a) => titleSim(a, p.artist))) : 0;
+			const v = 0.35 * p.prior + 1.2 * x + 0.6 * y - (p.penalty || 0);
+			if (v > best) {
+				best = v;
+				ts = x;
+				as = y;
+			}
+		}
+		if (best < 0) return { score: -1, titleScore: 0, artistScore: 0 };
+		let s = best;
+		if (titleSim(track, artist) > 0.9) s -= 0.3; // "Eve / Eve"
+		// uploads with junk in the names ("Shape of You [n096]", "🎼 ed | ...")
+		if (/\[[^\]]*\d[^\]]*\]|[🎼🎵🎶|#@]|https?:/u.test(track + ' ' + artist)) s -= 0.5;
+		// a video title saved as the song name ("[MV] Song", "【MV】Song")
+		else if (/[\[【(（]\s*(mv|pv|m\/v|official|music video)\s*[\]】)）]/i.test(track)) s -= 0.3;
+		// someone's cover uploaded as its own record ("怪獣の花唄 / 유즈하 리코 cover"): timed for
+		// that cover, not this video (unless it is this very upload)
+		if (/cover|covered|歌ってみた|カバー|커버|翻唱/i.test(track + ' ' + artist) && !(parsed.raw && titleSim(track, parsed.raw) > 0.8)) s -= 0.6;
+		// a live / remix / edit record for a video that is not one
+		if (VERSION.test(track) && !parsed.titles.some((t) => VERSION.test(t)) && !parsed.isLive && !parsed.isArrange) s -= 0.4;
+		if (!assumeSynced && parsed.raw && langMismatch(parsed.raw, rec.syncedLyrics || rec.plainLyrics)) s -= 1.6;
+		if (rec.syncedLyrics || assumeSynced) s += 0.25;
+		else if (!rec.plainLyrics) s -= 1;
+		if (rec.instrumental) s -= 1;
+		if (duration && rec.duration) {
+			const d = Math.abs(rec.duration - duration);
+			// covers / live versions / MVs with intros differ in length: weigh it less
+			const loose = parsed.isCover || parsed.isLive || parsed.isArrange;
+			const close = d <= 3 ? 0.35 : d <= 10 ? 0.2 : d <= 30 ? 0.05 : d <= 60 ? -0.15 : -0.5;
+			s += loose ? close * 0.5 : close;
+		}
+		return { score: s, titleScore: ts, artistScore: as };
+	}
+
+	// LRCLIB requests to try, most specific first
+	function requests(parsed, duration) {
+		const reqs = [];
+		const withArtist = parsed.pairs.filter((p) => p.artist).slice(0, 4);
+		for (const p of withArtist.slice(0, 3)) {
+			const q = { track_name: p.title, artist_name: p.artist };
+			if (duration && !parsed.isCover && !parsed.isLive) reqs.push({ path: 'get', params: { ...q, duration: Math.round(duration) } });
+			reqs.push({ path: 'search', params: q });
+		}
+		for (const t of parsed.titles.slice(0, 3)) reqs.push({ path: 'search', params: { track_name: t } });
+		for (const p of withArtist.slice(0, 2)) reqs.push({ path: 'search', params: { q: `${p.title} ${p.artist}` } });
+		const seen = new Set();
+		return reqs.filter((r) => {
+			const k = r.path + JSON.stringify(r.params);
+			if (seen.has(k)) return false;
+			seen.add(k);
+			return true;
+		});
+	}
+
+	// Runs the requests (with `fetchJson(url)`) until a confident match is found.
+	async function find(meta, fetchJson, { maxRequests = 8, base = 'https://lrclib.net/api/', sources = true } = {}) {
+		const parsed = parseVideo(meta);
+		const pool = new Map();
+		let tried = 0;
+		// LRCLIB not answering (overloaded, as it often is): after two failed requests it is
+		// left alone and the other databases are asked at once
+		let failed = 0;
+		const best = () => {
+			let b = null;
+			for (const r of pool.values()) if (!b || r.match.score > b.match.score) b = r;
+			return b;
+		};
+		for (const req of requests(parsed, meta.duration)) {
+			if (tried++ >= maxRequests) break;
+			const url = base + req.path + '?' + new URLSearchParams(req.params).toString();
+			let res;
+			try {
+				res = await fetchJson(url);
+			} catch (e) {
+				if (++failed >= 2) break;
+				continue;
+			}
+			for (const rec of Array.isArray(res) ? res : res && res.id ? [res] : []) {
+				if (!pool.has(rec.id)) pool.set(rec.id, { ...rec, match: score(rec, parsed, meta.duration) });
+			}
+			const b = best();
+			// stop early on a clear match (right title, right artist, synced), but only after
+			// both readings of the title ("A - B" as artist-song and song-artist) were asked
+			if (tried >= 3 && b && b.match.titleScore >= 0.95 && b.match.artistScore >= 0.8 && b.syncedLyrics) break;
+		}
+		// nothing yet: shorter beginnings of the title ("Just Be Friends at CREAM PUFF 3" ->
+		// "Just Be Friends"), the song is usually first
+		const okNow = () => { const b = best(); return b && b.match.titleScore >= 0.9 && b.match.score >= 1.2 && (b.syncedLyrics || b.plainLyrics); };
+		if (!okNow() && failed < 2) {
+			const prefixes = [];
+			for (const t of parsed.titles.slice(0, 3)) {
+				const words = t.split(/\s+/);
+				for (let n = Math.min(words.length - 1, 5); n >= 2; --n) prefixes.push(words.slice(0, n).join(' '));
+				const cjk = /^[\u3040-\u30ff\u3400-\u9fff]{2,}/.exec(t);
+				if (cjk && cjk[0] !== t) prefixes.push(cjk[0]);
+			}
+			const tried2 = new Set();
+			for (const pre of prefixes) {
+				const k = compact(pre);
+				if (k.length < 4 || tried2.has(k) || tried2.size >= 4) continue;
+				tried2.add(k);
+				parsed.pairs.push({ title: pre, artist: '', prior: 0.4 });
+				for (const a of parsed.artists.slice(0, 2)) parsed.pairs.push({ title: pre, artist: a, prior: 0.5 });
+				let res;
+				try {
+					res = await fetchJson(base + 'search?' + new URLSearchParams({ track_name: pre }).toString());
+				} catch (e) {
+					continue;
+				}
+				tried++;
+				for (const rec of res || []) if (!pool.has(rec.id)) pool.set(rec.id, { ...rec });
+				for (const r of pool.values()) r.match = score(r, parsed, meta.duration);
+				if (okNow()) break;
+			}
+		}
+		// LRCLIB had nothing sure (or did not answer): the other databases too
+		const sure = () => {
+			const b = best();
+			if (!b || !b.syncedLyrics || b.match.titleScore < 0.95) return false;
+			if (b.match.artistScore >= 0.8) return true;
+			// no artist in the title to check against (a cover named only by its song): sure
+			// only if the length agrees as well
+			return !parsed.isCover && meta.duration && b.duration && Math.abs(b.duration - meta.duration) <= 4;
+		};
+		// is the video surely a song? (a cover, an MV, a VOCALOID song, a "Topic" upload)
+		function looksLikeSong() {
+			const t = String(meta.title || '');
+			return parsed.isCover || parsed.isLive || parsed.isArrange || !!meta.music ||
+				/(\bmv\b|\bpv\b|m\/v|music video|official|lyric|歌詞|歌枠|弾き語り|feat\.?|ft\.|初音ミク|鏡音|巡音|GUMI|flower|可不|重音テト|歌愛ユキ|ボカロ|vocaloid|弾いてみた|カラオケ|karaoke|\boff vocal\b|full ver|フル|オリジナル曲|\s[\/／]\s|[「『].+[」』])/i.test(t) ||
+				/ - Topic$/.test(meta.channel || '');
+		}
+		// (not for any video at all: LRCLIB answered and knows nothing like it, and it does not
+		// look like a song)
+		const worth = () => failed >= 2 || looksLikeSong() || [...pool.values()].some((r) => r.match.titleScore >= 0.9);
+		if (sources && KCL.sources && !sure() && worth()) {
+			try {
+				const r = await KCL.sources.extend(pool, parsed, fetchJson, (rec, assume) => score(rec, parsed, meta.duration, assume), { extra: meta.music && meta.music.title ? [[meta.music.title, meta.music.artist].filter(Boolean).join(' ')] : [] });
+				tried += r.queries + r.fetched;
+			} catch (e) { /* LRCLIB's results stand */ }
+		}
+		// the same song/artist (in this orientation) uploaded by several people is more likely
+		// right than a one-off record with the names swapped
+		const count = new Map();
+		for (const r of pool.values()) {
+			const k = compact(r.trackName) + '|' + compact(r.artistName);
+			count.set(k, (count.get(k) || 0) + 1);
+		}
+		for (const r of pool.values()) r.match.score += 0.12 * Math.min(3, count.get(compact(r.trackName) + '|' + compact(r.artistName)) - 1);
+		// (records whose lyrics were not fetched come after every one that has lyrics)
+		const ranked = [...pool.values()].sort((a, b) => (a.lazy ? 1 : 0) - (b.lazy ? 1 : 0) || b.match.score - a.match.score);
+		let top = ranked[0];
+		// lyrics without times are a poor second: the same song with times (another upload of
+		// it, "Reol feat. kradness" for "Giga") is the better record when it is nearly as good
+		if (top && !top.syncedLyrics) {
+			const ref = meta.duration || top.duration || 0;
+			const off = (r) => (ref && r.duration ? Math.abs(r.duration - ref) : 0);
+			const alts = ranked.filter((r) => r.syncedLyrics && r.match.titleScore >= top.match.titleScore - 0.05 && r.match.score >= top.match.score - 0.9 && off(r) < 20);
+			// of those, the one closest in length (the times fit best)
+			const alt = alts.sort((a, b) => b.match.score - 0.04 * off(b) - (a.match.score - 0.04 * off(a)))[0];
+			if (alt) {
+				top = alt;
+				ranked.splice(ranked.indexOf(alt), 1);
+				ranked.unshift(alt);
+			}
+		}
+		const good = (r) => r && !r.lazy && r.match.titleScore >= 0.7 && r.match.score >= 1.2 && (r.syncedLyrics || r.plainLyrics);
+		// The other databases know countless songs: a record of theirs that matches by the song
+		// name alone is taken only when the video is surely a song (a cover, an MV, a "Topic"
+		// upload, the same length) - not for "zzqx オリジナル曲 夜明けのメロディ"
+		const trusted = (r) => {
+			if (!(KCL.sources && KCL.sources.isSourceId(r.id)) || r.match.artistScore >= 0.5) return true;
+			const songLike = looksLikeSong() || (meta.duration && r.duration && Math.abs(r.duration - meta.duration) <= 3);
+			return songLike && r.match.titleScore >= 0.9 && KCL.compact(r.trackName).length >= 2 && !/^\d+$/.test(KCL.compact(r.trackName));
+		};
+		let ok = good(top) && trusted(top);
+		if (good(top) && !ok) {
+			// the next good one that can be trusted (LRCLIB's, usually), if close enough
+			const alt = ranked.find((r) => r !== top && good(r) && trusted(r) && r.match.score >= top.match.score - 0.8);
+			if (alt) {
+				top = alt;
+				ok = true;
+			}
+		}
+		return { parsed, best: ok ? top : null, candidates: ranked.slice(0, 12), requests: tried };
+	}
+
+	KCL.query = { parseVideo, score, requests, find, cleanArtist, stripNoise, langMismatch };
+})(globalThis);

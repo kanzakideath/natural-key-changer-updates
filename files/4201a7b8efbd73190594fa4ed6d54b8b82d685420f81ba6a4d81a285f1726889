@@ -1,0 +1,197 @@
+// Lyrics written in a video's description or in its comments.
+//
+//  - timed: lines starting with a time ("0:15 ...", "1:02:03 ...", "[00:15.20] ...") that
+//    increase: lyrics already timed for this very video (the best source for covers)
+//  - plain: the block of the text that looks most like lyrics (many short lines, few links /
+//    credits / hashtags, stanzas, repeated lines), with romaji / translation lines removed
+//    when the lyrics are Japanese
+//  - credits: "原曲：Song / Artist", "本家様：…", "作詞作曲：…", "Original: …" -> more search
+//    candidates for the lyrics database
+(function (root) {
+	const KCL = (root.KCL = root.KCL || {});
+
+	const TIME = /^\s*[\[(（【]?\s*(?:(\d{1,2}):)?(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\s*[\])）】]?\s*[-–—~〜:：|｜]?\s*(.*)$/;
+	const NOT_LYRIC = /(https?:\/\/|www\.|@\w|#\S|^\s*\(c\)|^\s*[✦✧◇◆■□●○★☆▶►▼▽→⇒※〈《]|[¥￥$＄]\s*[\d,]+|\d[\d,]*\s*円|税込|チケット|ticket|料金|特典|グッズ|公演|開場|開演|会場|日時|先行|抽選|販売|予約|セットリスト|setlist|出演|入場|整理番号|ドリンク|配信開始|生放送|メンバーシップ|membership|チャンネル登録|高評価|^\s*[\[(（【]?\s*(作詞|作曲|編曲|歌唱|vocal|vo\.|mix|mastering|illust|イラスト|動画|movie|video|guitar|bass|drums|piano|原曲|本家|lyrics?\s*[:：]|music\s*[:：]|composer|arrange|thumbnail|サムネ|instrumental|inst\.?|off\s*vocal|配信|stream|spotify|apple music|itunes|twitter|x\.com|instagram|tiktok|niconico|ニコニコ|youtube|チャンネル登録|subscribe|お借り|使用|使わせて|ダウンロード|download|お問い合わせ|contact|©|℗|\(c\)|all rights|copyright|official|公式|release|リリース|発売|ライブ|live|tour|ツアー|chapters?|チャプター|タイムスタンプ|timestamp|sm\d+|nm\d+|mylist)(?![a-z]))/i;
+	const HEADER = /^\s*[\[(（【「『]?\s*(歌詞|lyrics?|lyric\s*video|kashi|가사)\s*[\])）】」』]?\s*[:：]?\s*$/i;
+	// "nqrseさんのラップパート", "rap part:", "ラップ歌詞", "〇〇パート"
+	const PART_HEADER = /^\s*[\[(（【「『]?.{0,24}?(ラップ|ﾗｯﾌﾟ|rap|랩)\s*(パート|部分|歌詞|詞|part|verse|lyrics?)\s*[\])）】」』]?\s*[:：]?\s*$|^\s*[\[(（【]?.{1,16}?(パート|part)\s*[\])）】]?\s*[:：]?\s*$/i;
+
+	const hasJa = (s) => /[぀-ヿ㐀-鿿]/.test(s);
+	const hasKo = (s) => /[가-힯]/.test(s);
+	// "kimi no koe ga kikoeru": Japanese written in latin letters
+	function isRomaji(s) {
+		if (!/^[a-zA-Z\s'’,.!?~\-()]+$/.test(s)) return false;
+		const words = s.toLowerCase().replace(/[^a-z\s]/g, ' ').split(/\s+/).filter(Boolean);
+		if (words.length < 2) return false;
+		const syl = /^(?:(?:[kgsztdnhbpmyrwfjcv]|sh|ch|ts|ky|gy|ny|hy|my|ry|by|py|j)?[aiueo]|n|m)+$/;
+		const doubled = (w) => w.replace(/([kstpgdbcj])\1/g, '$1');
+		return words.filter((w) => syl.test(doubled(w))).length / words.length >= 0.8;
+	}
+
+	function timeOf(m) {
+		return (m[1] ? Number(m[1]) * 3600 : 0) + Number(m[2]) * 60 + Number(m[3]) + (m[4] ? Number(m[4]) / 10 ** m[4].length : 0);
+	}
+
+	// timed lyrics: >= 6 time-stamped lines with text, increasing, not a chapter list
+	function timed(text) {
+		const lines = [];
+		for (const raw of String(text || '').split(/\r?\n/)) {
+			const m = TIME.exec(raw);
+			if (!m || !m[5] || !m[5].trim()) continue;
+			const t = timeOf(m);
+			const txt = m[5].trim();
+			// several stamps on one line ("0:15 0:45 chorus") / chapter-like entries
+			if (TIME.test(txt) || NOT_LYRIC.test(txt)) continue;
+			lines.push({ t, text: txt });
+		}
+		if (lines.length < 6) return null;
+		let inc = 0;
+		for (let i = 1; i < lines.length; ++i) if (lines[i].t >= lines[i - 1].t) inc++;
+		if (inc < 0.9 * (lines.length - 1)) return null;
+		// chapters are few and far apart; lyrics come every few seconds
+		const span = lines[lines.length - 1].t - lines[0].t;
+		if (span / lines.length > 12) return null;
+		// chapter names are short labels ("Intro", "1番", "サビ")
+		const labelish = lines.filter((l) => /^(intro|outro|verse|chorus|bridge|サビ|イントロ|間奏|アウトロ|\d+番|[aｂb]メロ|cメロ|ラスサビ|落ちサビ)$/i.test(l.text)).length;
+		if (labelish > lines.length * 0.3) return null;
+		lines.sort((a, b) => a.t - b.t);
+		return lines;
+	}
+
+	function lrcOf(lines) {
+		const ts = (t) => `[${String(Math.floor(t / 60)).padStart(2, '0')}:${(t % 60).toFixed(2).padStart(5, '0')}]`;
+		return lines.map((l) => ts(l.t) + l.text).join('\n');
+	}
+
+	const CHATTER = /歌詞(です|を|書|貼|載|まとめ|置|あります)|見て(下|くだ)さい|読んで(下|くだ)さい|よかったら|良かったら|書いてる|書いてい|方たくさん|コメント|高評価|チャンネル登録|登録(お願|よろ)|ありがとうござ|いいね|拡散|お願いします|^※|lyrics\b.*(here|below)|^here.?s the lyrics/i;
+
+	const furigana = (x) => x.replace(/([\u3400-\u9fff々〆ヵヶ])[（(]([\u3041-\u309f\u30a1-\u30fcー]{1,24})[)）]/g, '$1');
+
+	// the block of text that looks most like lyrics
+	function plain(text) {
+		const rows = String(text || '').split(/\r?\n/).map((s) => s.replace(/\s+$/, ''));
+		// candidate blocks: split where something clearly not lyrics appears; blank lines stay
+		// (stanzas)
+		const blocks = [];
+		let cur = [];
+		let afterHeader = false;
+		const flush = () => {
+			if (cur.length) blocks.push({ rows: cur, afterHeader });
+			cur = [];
+		};
+		for (const r of rows) {
+			const s = r.trim();
+			if (HEADER.test(s) || PART_HEADER.test(s)) {
+				flush();
+				afterHeader = true;
+				continue;
+			}
+			if (s && (NOT_LYRIC.test(s) || s.length > 70 || TIME.test(s) || /^[-=_*~・●■◆★☆♪♫]{3,}$/.test(s))) {
+				flush();
+				afterHeader = false;
+				continue;
+			}
+			cur.push(s);
+		}
+		flush();
+		let best = null;
+		for (const b of blocks) {
+			// trim blank lines at the ends, collapse runs of blanks
+			let r = b.rows.slice();
+			while (r.length && !r[0]) r.shift();
+			while (r.length && !r[r.length - 1]) r.pop();
+			r = r.filter((x, i) => x || (i > 0 && r[i - 1]));
+			const lines = r.filter(Boolean);
+			if (lines.length < 6) continue;
+			// Japanese lyrics printed with romaji and / or an English translation: keep the
+			// Japanese lines (only when that is clearly what the block is)
+			const ja = lines.filter(hasJa).length;
+			const latin = lines.filter((x) => !hasJa(x) && !hasKo(x));
+			const romaji = latin.filter(isRomaji).length;
+			if (ja >= 6 && (romaji >= 3 || latin.length >= ja * 0.6)) {
+				const keep = r.filter((x) => !x || hasJa(x));
+				r = keep.filter((x, i) => x || (i > 0 && keep[i - 1]));
+			}
+			// a commenter's own words around the lyrics ("歌詞です！ よかったら見て下さい！")
+			while (r.length && (!r[0] || CHATTER.test(r[0]))) r.shift();
+			while (r.length && (!r[r.length - 1] || CHATTER.test(r[r.length - 1]))) r.pop();
+			const L = r.filter(Boolean);
+			if (L.length < 6) continue;
+			const avg = L.reduce((n, x) => n + x.length, 0) / L.length;
+			const uniq = new Set(L.map((x) => KCL.compact(x))).size;
+			const repeated = L.length - uniq; // choruses
+			const stanzas = r.filter((x) => !x).length;
+			let score = Math.min(L.length, 60) * 1.0;
+			if (avg < 3 || avg > 45) score -= 30;
+			score += Math.min(repeated, 10) * 1.5 + Math.min(stanzas, 8) * 1.5;
+			if (b.afterHeader) score += 15;
+			// sentences with full stops everywhere read like prose, not lyrics
+			const prose = L.filter((x) => /[。.]\s*$/.test(x) && x.length > 25).length;
+			score -= prose * 2;
+			if (!best || score > best.score) best = { score, rows: r };
+		}
+		if (!best || best.score < 10) return null;
+		// readings written after kanji by the commenter: 剥（は）いで -> 剥いで
+		best.rows = best.rows.map(furigana);
+		return { text: best.rows.join('\n'), lines: best.rows.filter(Boolean).length, score: best.score };
+	}
+
+	// "原曲：シャルル / バルーン", "本家様：…", "Original: Song - Artist", "作詞・作曲：ハチ",
+	// "40mP様のからくりピエロを歌わせていただきました", "원곡(Vaundy): <link>".
+	// links: ids of YouTube videos given as the original (their titles name the song)
+	function credits(text) {
+		const out = { songs: [], artists: [], links: [] };
+		const ytId = (x) => {
+			const m = /(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:\S*?&)?v=|shorts\/|embed\/))([\w-]{11})/.exec(x);
+			return m ? m[1] : null;
+		};
+		const rows = String(text || '').split(/\r?\n/).map((r) => r.normalize('NFKC').trim());
+		for (let i = 0; i < rows.length; ++i) {
+			const s = rows[i].replace(/^[\[(（【■◆●・▶►\s]+|[\])）】]$/g, '');
+			const next = rows[i + 1] || '';
+			// "40mP様のからくりピエロ(…)を歌わせていただきました"
+			const sung = /^(?:[^\s、。]{0,6}\s)?([^、。\s][^、。]{1,29}?)\s*(?:様|さん|氏)の\s*[「『]?([^「『」』()（）、。]{1,40}?)[」』]?\s*(?:[(（]|を|、|$)/.exec(s);
+			if (sung && /歌わせ|歌って|歌いました|カバー|cover|お借り|弾かせ/i.test(s + ' ' + next) && !/^(皆|みな|視聴者|リスナー|フォロワー)/.test(sung[1])) {
+				out.songs.push(sung[2].trim());
+				out.artists.push(sung[1].trim());
+				continue;
+			}
+			// "괴수의 꽃노래 원곡(Vaundy):" — the song before the label
+			const pre = /^(.{1,40}?)\s+(?=(?:原曲|元曲|원곡|original)\s*(?:[(（][^)）]{1,40}[)）])?\s*[:：])/i.exec(s);
+			if (pre) out.songs.push(pre[1].replace(/[「『」』]/g, '').trim());
+			let m = /^(?:.{1,40}?\s+(?=(?:原曲|元曲|원곡|original)\s*(?:[(（][^)）]{1,40}[)）])?\s*[:：]))?(原曲|本家(?:様)?|元曲|원곡|original(?:\s*song|\s*video|\s*mv)?|song|曲名?|楽曲|カバー元)\s*(?:[(（]([^)）]{1,40})[)）])?\s*(?:[:：]\s*|\s+|$)(.*)$/i.exec(s);
+			// "Song" needs its colon (it starts many lyric lines)
+			if (m && /^(song|曲)$/i.test(m[1]) && !/^(song|曲)\s*[:：]/i.test(s)) m = null;
+			if (m) {
+				// "원곡(Vaundy)": the artist in brackets
+				if (m[2]) out.artists.push(m[2].trim());
+				let value = m[3] || '';
+				// "Original by DECO*27 feat Miku Hatsune": who, not what
+				const by = /^by\s+(.+)$/i.exec(value.replace(/https?:\/\/\S+/g, '').trim());
+				if (by) {
+					out.artists.push(by[1].split(/\s+(?:feat\.?|ft\.?)\s+|\s*[\/／(（]/i)[0].trim());
+					const id = ytId(value) || ytId(next);
+					if (id) out.links.push(id);
+					continue;
+				}
+				// the original given as a link (on this line or the next)
+				const id = ytId(value) || (!value.replace(/https?:\/\/\S+/g, '').trim() && ytId(next));
+				if (id) out.links.push(id);
+				// "【鏡音リン・レン】おこちゃま戦争【オリジナル】": the bracketed parts are labels
+				const v = value.replace(/https?:\/\/\S+|sm\d+|nm\d+/g, '').replace(/【[^】]*】?|\[[^\]]*\]?/g, ' ').trim() || value.replace(/https?:\/\/\S+|[【】\[\]]/g, ' ').trim();
+				const parts = v.split(/\s*[\/／]\s*|\s+-\s+|\s*[｜|]\s*/).map((x) => x.replace(/^[「『"]|[」』"]$/g, '').trim()).filter(Boolean);
+				if (parts[0]) out.songs.push(parts[0]);
+				if (parts[1]) out.artists.push(parts[1].replace(/\s*(様|さん)$/, ''));
+				continue;
+			}
+			m = /^(?:作詞\s*[・&,、]?\s*作曲|作詞作曲|作曲|作詞|music(?:\s*&\s*lyrics)?|composer|lyricist|lyrics\s*&\s*music|words\s*&\s*music|written\s+by)\s*[:：]?\s*(.+)$/i.exec(s);
+			if (m) out.artists.push(m[1].replace(/https?:\/\/\S+|@\S+/g, '').split(/\s*[\/／(（]/)[0].replace(/\s*(様|さん)$/, '').trim());
+		}
+		out.songs = [...new Set(out.songs.filter((x) => x && x.length <= 60))];
+		out.artists = [...new Set(out.artists.filter((x) => x && x.length <= 40))];
+		out.links = [...new Set(out.links)].slice(0, 2);
+		return out;
+	}
+
+	KCL.textLyrics = { timed, plain, credits, lrcOf, isRomaji };
+})(globalThis);
