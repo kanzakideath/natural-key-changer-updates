@@ -1,0 +1,1963 @@
+// Synced lyrics panel for YouTube (top of the right-hand column, about the size of the
+// playlist box). Finds the lyrics of what is playing, follows the song line by line in the
+// style of Apple Music / Spotify, and accepts timing corrections from the user and from the
+// audio analysis (see lib/lyrics/align.js).
+//
+// Cost: nothing runs per frame. Line changes are scheduled with a timer for the next line
+// start and re-synchronised on play / pause / seek / rate changes; all motion is transform /
+// opacity transitions (GPU compositor); word fills and the interlude dots are CSS animations
+// that are paused together with the video.
+(() => {
+	if (window.__kcLyrics) return;
+	window.__kcLyrics = true;
+	const KCL = globalThis.KCL;
+	const MOB = globalThis.KC_MOBILE || null; // the phone edition (userscript): see mobile/src/main.js
+	const msg = (k, sub) => {
+		try {
+			return chrome.i18n.getMessage(k, sub) || k;
+		} catch (e) {
+			return k; // extension reloaded: the old content script has no API any more
+		}
+	};
+	const alive = () => {
+		try {
+			return !!chrome.runtime.id;
+		} catch (e) {
+			return false;
+		}
+	};
+	const send = (m) => (alive() ? chrome.runtime.sendMessage({ target: 'background', ...m }).catch(() => null) : Promise.resolve(null));
+
+	// The extension can be reloaded (an update) while this page stays open. This script is then
+	// cut off from it (no messages, no texts): it notices within a second and takes all of its
+	// own off the page - the panel, its timers, its listeners - and the new version's script,
+	// put into the page by the background, takes over. Page listeners and repeating timers are
+	// registered through on() / every() so they can be undone.
+	const offs = [];
+	const on = (target, ev, fn, opts) => { target.addEventListener(ev, fn, opts); offs.push(() => target.removeEventListener(ev, fn, opts)); };
+	const every = (fn, ms) => { const id = setInterval(fn, ms); offs.push(() => clearInterval(id)); return id; };
+	let retired = false;
+	function retire() {
+		if (retired) return;
+		retired = true;
+		window.__kcLyrics = false;
+		for (const f of offs.splice(0)) { try { f(); } catch (e) { /* gone already */ } }
+		try { S.gen++; } catch (e) { /* not set up yet */ }
+		try {
+			for (const t of [timer, needTimer, liveSaveTimer, toastTimer, timingTimer, ambientTimer, K.timer, K.hintTimer, S.manualTimer]) clearTimeout(t);
+		} catch (e) { /* (retired while starting up) */ }
+		try { bindVideo(null); } catch (e) { /* no video */ }
+		for (const o of observers) o.disconnect();
+		if (host) host.remove();
+		host = root = null;
+	}
+	const observers = [];
+
+	// ---------------------------------------------------------------- state
+	const S = {
+		enabled: true,
+		videoId: null,
+		meta: null,
+		rec: null, // chosen lyrics record {id, trackName, artistName, duration, synced}
+		lines: [],
+		synced: false,
+		map: new KCL.TimeMap(),
+		mapSource: 'none', // none | user | auto
+		audioDelay: 0, // seconds the heard sound lags the video clock (key changer running)
+		status: 'idle', // idle | searching | ready | notfound | error | live
+		idx: -2,
+		manualUntil: 0,
+		manualY: 0,
+		tapSync: false,
+		collapsed: false,
+		candidates: [],
+		live: [], // lines heard by speech recognition but not in the lyrics: {m, text}
+		gen: 0, // bumps on every song change, so late async results are dropped
+		follower: null, // KCL.Tracker: real-time alignment to the singing (needs the key changer on)
+		capturing: false, // this tab's audio is being analysed
+		horizon: -1, // latest media time analysed
+		lastSolveAt: 0,
+		shedUntil: 0, // performance.now() until which the speech recognition stays paused (the video struggles)
+		announced: false,
+		lang: null,
+		plain: null, // KCL.PlainTimer: timing lyrics that came without times
+		around: null, // {videoId, info, comments}: description and comments of this video
+	};
+	let video = null;
+	let timer = 0;
+	let host = null, root = null, $ = null;
+	let positions = []; // offsetTop of each line element (layout is static; only transforms move)
+	let visible = true;
+
+	// ---------------------------------------------------------------- markup
+	// innerHTML, and where a page forbids strings for it (Trusted Types, which a userscript is
+	// not exempt from) the same markup built node by node. Only the simple markup this file
+	// writes itself: tags, quoted attributes, text, a few entities.
+	const ENT = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", minus: '\u2212', times: '\u00d7', nbsp: '\u00a0' };
+	const unent = (t) => t.replace(/&(#x?[0-9a-f]+|\w+);/gi, (m, e) => (e[0] === '#' ? String.fromCodePoint(e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10)) : ENT[e] !== undefined ? ENT[e] : m));
+	const VOID = new Set(['input', 'br', 'img', 'hr']);
+	function parseInto(parent, html) {
+		const re = /<!--[\s\S]*?-->|<\/([a-zA-Z][\w-]*)\s*>|<([a-zA-Z][\w-]*)((?:\s+[^\s=>\/]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?)*)\s*(\/?)>|([^<]+)/g;
+		const SVG = 'http://www.w3.org/2000/svg';
+		const stack = [parent];
+		let m;
+		while ((m = re.exec(html))) {
+			const top = stack[stack.length - 1];
+			if (m[5] !== undefined) top.append(unent(m[5]));
+			else if (m[1]) { if (stack.length > 1) stack.pop(); }
+			else if (m[2]) {
+				const tag = m[2].toLowerCase();
+				const svg = tag === 'svg' || (top.namespaceURI === SVG && top.localName !== 'foreignObject');
+				const el = svg ? document.createElementNS(SVG, tag) : document.createElement(tag);
+				for (const a of m[3].matchAll(/([^\s=>\/]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g)) el.setAttribute(a[1], unent(a[2] ?? a[3] ?? a[4] ?? ''));
+				top.append(el);
+				if (tag === 'style') {
+					const end = html.indexOf('</style>', re.lastIndex);
+					el.textContent = html.slice(re.lastIndex, end);
+					re.lastIndex = end + 8;
+				} else if (!m[4] && !VOID.has(tag)) stack.push(el);
+			}
+		}
+	}
+	function setHTML(el, html) {
+		try {
+			el.innerHTML = html;
+		} catch (e) {
+			el.textContent = '';
+			parseInto(el, html);
+		}
+	}
+
+	// ---------------------------------------------------------------- page helpers
+	const isWatch = () => location.pathname === '/watch' && new URLSearchParams(location.search).get('v');
+	const currentId = () => new URLSearchParams(location.search).get('v');
+	const qs = (s) => document.querySelector(s);
+	// phone edition: the key control is on every page with a video, the lyrics only on a video page
+	const dockPage = () => !!(MOB && MOB.dock());
+	const text = (el) => (el ? el.textContent.replace(/\s+/g, ' ').trim() : '');
+
+	function readMeta() {
+		const title = text(qs('ytd-watch-metadata h1 yt-formatted-string')) || text(qs('ytd-watch-metadata h1')) || text(qs('.slim-video-information-title')) || text(qs('ytm-slim-video-metadata-section-renderer h2')) || document.title.replace(/\s*-\s*YouTube\s*$/, '').replace(/^\(\d+\)\s*/, '');
+		const channel = text(qs('ytd-watch-metadata ytd-channel-name a')) || text(qs('#owner ytd-channel-name a')) || text(qs('ytd-video-owner-renderer ytd-channel-name')) || text(qs('ytm-slim-owner-renderer .slim-owner-channel-name')) || text(qs('.slim-owner-channel-name'));
+		// "Music" section in the description (songs matched by YouTube): song + artist
+		let music = null;
+		const attr = qs('ytd-watch-metadata yt-video-attribute-view-model') || qs('yt-video-attribute-view-model');
+		if (attr) {
+			const t = text(attr.querySelector('[class*="__title"]')), a = text(attr.querySelector('[class*="__subtitle"]'));
+			if (t) music = { title: t, artist: a.replace(/\s*[•·].*$/, '') };
+		}
+		const v = mainVideo();
+		const ad = qs('#movie_player.ad-showing') || (MOB && qs('.html5-video-player.ad-showing'));
+		const duration = v && !ad && isFinite(v.duration) ? v.duration : 0;
+		return { title, channel, music, duration, videoId: currentId() };
+	}
+
+	function mainVideo() {
+		if (MOB) return MOB.video();
+		return qs('#movie_player video.html5-main-video') || qs('#movie_player video') || qs('video');
+	}
+
+	// ---------------------------------------------------------------- panel
+	const CSS = `
+:host { all: initial; display: block; margin: 0 0 16px; contain: layout style; }
+.keybar { display: flex; align-items: center; gap: 6px; margin: 0 0 10px; padding: 6px 8px 6px 14px; height: 44px; border-radius: 22px; color: #fff;
+	background: linear-gradient(180deg, rgba(48,48,54,.96), rgba(30,30,34,.96)); box-shadow: 0 1px 0 rgba(255,255,255,.06) inset, 0 6px 18px rgba(0,0,0,.28);
+	font: 600 13px/1 "Roboto", "Hiragino Sans", "Noto Sans JP", "Yu Gothic UI", system-ui, sans-serif; position: relative; overflow: hidden;
+	transition: background .3s ease, box-shadow .3s ease; }
+.keybar.changed { background: linear-gradient(180deg, rgba(104,98,232,.95), rgba(76,70,196,.96)); }
+.keybar .kl { opacity: .62; letter-spacing: .04em; margin-right: auto; font-weight: 600; }
+.keybar .kb { width: 32px; height: 32px; border: 0; border-radius: 50%; padding: 0; cursor: pointer; color: inherit; font: 500 20px/32px system-ui, sans-serif;
+	background: rgba(255,255,255,.14); transition: transform .18s cubic-bezier(.22,1.18,.36,1), background .2s ease, opacity .2s ease; }
+.keybar .kb:hover { background: rgba(255,255,255,.24); }
+.keybar .kb:active { transform: scale(.88); background: rgba(255,255,255,.3); }
+.keybar .kb:disabled { opacity: .3; pointer-events: none; }
+.keybar .kv { min-width: 46px; text-align: center; font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.keybar .num { display: inline-block; }
+.keybar .num.tick { animation: keytick .28s cubic-bezier(.22,1.18,.36,1); }
+@keyframes keytick { from { transform: translateY(7px) scale(.92); opacity: .2; } to { transform: none; opacity: 1; } }
+.keybar .kr { border: 0; border-radius: 14px; padding: 0 11px; height: 28px; cursor: pointer; color: inherit; font: 600 12px/28px system-ui, sans-serif; background: rgba(255,255,255,.18); transition: background .2s ease; }
+.keybar .kr:hover { background: rgba(255,255,255,.3); }
+.keybar .kr[hidden], .keybar .ku[hidden] { display: none; }
+.keybar .ku { border: 0; border-radius: 14px; padding: 0 11px; height: 28px; cursor: pointer; color: #fff; font: 700 12px/28px system-ui, sans-serif; background: rgba(255,255,255,.2); animation: kupulse 2.4s ease-in-out 3; }
+@keyframes kupulse { 50% { background: rgba(255,255,255,.34); } }
+.keybar.off { background: linear-gradient(180deg, rgba(48,48,54,.8), rgba(30,30,34,.8)); }
+.keybar.off .kb, .keybar.off .kv { opacity: .4; }
+.keybar .kh { position: absolute; inset: 0; display: flex; align-items: center; padding: 0 16px; font-weight: 500; font-size: 12px; background: rgba(40,40,46,.98);
+	opacity: 0; transform: translateY(8px); pointer-events: none; transition: opacity .25s ease, transform .25s ease; }
+.keybar.hint .kh { opacity: 1; transform: none; }
+@media (prefers-reduced-motion: reduce) { .keybar .num.tick { animation: none; } }
+* { box-sizing: border-box; }
+.card {
+	--fg: #fff; --fg2: rgba(255,255,255,.62); --fg3: rgba(255,255,255,.36); --dim: rgba(255,255,255,.30); --past: rgba(255,255,255,.22);
+	--chip: rgba(255,255,255,.14); --chip2: rgba(255,255,255,.22); --line: rgba(255,255,255,.12);
+	--spring: cubic-bezier(.22, 1.18, .36, 1); --ease: cubic-bezier(.25, .1, .25, 1); --out: cubic-bezier(.16, 1, .3, 1);
+	position: relative; height: 412px; border-radius: 14px; overflow: hidden; color: var(--fg);
+	font: 500 14px/1.4 "Roboto", "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic UI", "Meiryo", system-ui, sans-serif;
+	-webkit-font-smoothing: antialiased; background: #1b1b22; isolation: isolate;
+	transition: height .5s var(--out);
+	box-shadow: 0 0 0 1px rgba(255,255,255,.06) inset;
+}
+.card.collapsed { height: 56px; }
+.bg { position: absolute; inset: 0; z-index: -1; transition: opacity 1.6s var(--ease); }
+.bg.b { opacity: 0; }
+.bg::after { content: ""; position: absolute; inset: 0; background: linear-gradient(180deg, rgba(0,0,0,.08), rgba(0,0,0,.38)); }
+header { position: relative; z-index: 3; display: flex; align-items: center; gap: 6px; height: 56px; padding: 0 8px 0 14px; }
+.art { width: 32px; height: 32px; border-radius: 7px; flex: none; background: var(--chip) center/cover no-repeat; box-shadow: 0 2px 8px rgba(0,0,0,.25); }
+.meta { flex: 1; min-width: 0; padding-left: 4px; }
+.meta .t { font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; letter-spacing: .01em; }
+.meta .s { font-size: 12px; color: var(--fg2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
+.meta .s b { font-weight: 500; color: var(--fg); background: var(--chip); border-radius: 5px; padding: 0 5px; margin-right: 4px; font-size: 11px; }
+.meta .s i.ai { font-style: normal; font-weight: 700; font-size: 10px; letter-spacing: .04em; margin-right: 5px; padding: 1px 5px; border-radius: 5px; color: #fff;
+	background: linear-gradient(90deg, #7a6cff, #ff6fb1); opacity: .9; }
+.card:not(.paused) .meta .s i.ai { animation: aiGlow 2.6s ease-in-out infinite; }
+@keyframes aiGlow { 50% { opacity: .55; } }
+.hint { font-size: 11.5px; color: var(--fg2); text-align: center; margin: 8px 4px 0; line-height: 1.45; }
+button { font: inherit; color: inherit; border: 0; background: none; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.icon { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; flex: none; color: var(--fg2); transition: background .2s, color .2s, transform .35s var(--spring); }
+.icon:hover { background: var(--chip); color: var(--fg); }
+.icon:active { transform: scale(.88); }
+.icon svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.icon.on { color: var(--fg); background: var(--chip2); }
+.collapsed #collapse svg { transform: rotate(180deg); }
+#collapse svg { transition: transform .45s var(--spring); }
+
+.viewport { position: absolute; left: 0; right: 0; top: 56px; bottom: 0; overflow: hidden;
+	-webkit-mask-image: linear-gradient(180deg, transparent 0, #000 9%, #000 78%, transparent 100%);
+	mask-image: linear-gradient(180deg, transparent 0, #000 9%, #000 78%, transparent 100%);
+	transition: opacity .35s var(--ease); }
+.collapsed .viewport { opacity: 0; pointer-events: none; }
+.lines { position: relative; padding: 0 22px 0 18px; }
+.line { position: relative; padding: 9px 10px; margin: 0 -10px; border-radius: 10px;
+	font-size: 23px; line-height: 1.32; font-weight: 700; letter-spacing: .005em; word-break: break-word; overflow-wrap: anywhere;
+	color: var(--fg); opacity: .3; transform-origin: 0 50%;
+	transition: transform .9s var(--spring), opacity .45s var(--ease), background-color .2s;
+	will-change: transform; cursor: pointer; }
+.line:hover { background: rgba(255,255,255,.07); }
+.line.past { opacity: .22; }
+.line.on { opacity: 1; }
+.line.near { opacity: .42; }
+.line.live { font-style: normal; }
+.line.live .tag, .line .tag { display: inline-block; vertical-align: 3px; margin-left: 8px; font-size: 10px; font-weight: 600; letter-spacing: .04em;
+	padding: 2px 6px; border-radius: 5px; background: var(--chip2); color: var(--fg); opacity: .9; }
+.line.empty { height: 8px; padding: 0; pointer-events: none; }
+.manual .line { opacity: .55; }
+.manual .line.on { opacity: 1; }
+.unsynced .line { opacity: .82; cursor: default; font-size: 20px; }
+.unsynced .line:hover { background: none; }
+.on .w { background-image: linear-gradient(90deg, var(--fg) 0 50%, var(--fg3) 50% 100%); background-size: 200% 100%; background-position: 100% 0;
+	-webkit-background-clip: text; background-clip: text; color: transparent; animation: wfill var(--d, .3s) linear var(--dl, 0s) both; }
+@keyframes wfill { from { background-position: 100% 0; } to { background-position: 0 0; } }
+
+.dots { display: flex; gap: 9px; height: 0; overflow: visible; padding: 0; opacity: 0; transform-origin: 0 50%;
+	transition: transform .9s var(--spring), opacity .4s var(--ease), height .5s var(--out), padding .5s var(--out); pointer-events: none; }
+.dots.on { height: 46px; padding: 14px 0 12px; opacity: 1; }
+.dots i { width: 13px; height: 13px; border-radius: 50%; background: var(--fg); opacity: .25; transform: scale(.7); }
+.dots.on { animation: breathe 2.4s ease-in-out infinite; }
+.dots.on i { animation-name: dot; animation-timing-function: ease-out; animation-fill-mode: both; }
+@keyframes dot { from { opacity: .25; transform: scale(.7); } to { opacity: 1; transform: scale(1); } }
+@keyframes breathe { 50% { transform: var(--tf) scale(1.1); } }
+.paused .on .w, .paused .dots.on, .paused .dots.on i { animation-play-state: paused; }
+
+.status { position: absolute; inset: 0; display: grid; place-items: center; padding: 22px; text-align: center; pointer-events: none; opacity: 0;
+	transition: opacity .3s var(--ease); }
+.status.show { opacity: 1; pointer-events: auto; }
+.status .big { font-size: 17px; font-weight: 700; }
+.status .small { font-size: 13px; color: var(--fg2); margin-top: 6px; line-height: 1.5; }
+.status .row { display: flex; gap: 8px; justify-content: center; margin-top: 16px; flex-wrap: wrap; }
+.btn { padding: 8px 14px; border-radius: 999px; background: var(--chip2); font-size: 13px; font-weight: 600; transition: transform .35s var(--spring), background .2s; }
+.btn:hover { background: rgba(255,255,255,.3); }
+.btn:active { transform: scale(.94); }
+.btn.primary { background: #fff; color: #111; }
+.skel { width: 100%; padding: 0 4px; }
+.skel i { display: block; height: 22px; border-radius: 8px; margin: 14px 0; background: linear-gradient(90deg, rgba(255,255,255,.08) 0 40%, rgba(255,255,255,.18) 50%, rgba(255,255,255,.08) 60% 100%);
+	background-size: 300% 100%; animation: shimmer 1.4s linear infinite; }
+.skel i:nth-child(2) { width: 82%; } .skel i:nth-child(3) { width: 64%; } .skel i:nth-child(4) { width: 88%; }
+@keyframes shimmer { from { background-position: 100% 0; } to { background-position: 0 0; } }
+
+.pill { position: absolute; left: 50%; bottom: 14px; z-index: 4; transform: translate(-50%, 18px) scale(.9); opacity: 0; pointer-events: none;
+	padding: 8px 14px 8px 12px; border-radius: 999px; background: rgba(255,255,255,.92); color: #111; font-size: 12.5px; font-weight: 600;
+	box-shadow: 0 6px 20px rgba(0,0,0,.3); display: flex; align-items: center; gap: 6px;
+	transition: transform .5s var(--spring), opacity .25s var(--ease); }
+.pill svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
+.pill.show { transform: translate(-50%, 0) scale(1); opacity: 1; pointer-events: auto; }
+
+.sheet { position: absolute; left: 8px; right: 8px; bottom: 8px; z-index: 5; border-radius: 14px; padding: 12px;
+	background: rgba(28,28,34,.94); box-shadow: 0 10px 40px rgba(0,0,0,.45), 0 0 0 1px rgba(255,255,255,.08) inset;
+	transform: translateY(calc(100% + 16px)); opacity: 0; pointer-events: none;
+	transition: transform .55s var(--spring), opacity .25s var(--ease); max-height: calc(100% - 64px); display: flex; flex-direction: column; }
+.sheet.show { transform: none; opacity: 1; pointer-events: auto; }
+.sheet h3 { margin: 0 0 10px; font-size: 13px; font-weight: 700; display: flex; align-items: center; justify-content: space-between; }
+.sheet h3 button { color: #8ab4ff; font-weight: 600; font-size: 13px; }
+.seg { display: flex; gap: 6px; }
+.seg .btn { flex: 1; padding: 9px 0; }
+.off { text-align: center; font-size: 13px; color: var(--fg2); margin: 10px 0 8px; font-variant-numeric: tabular-nums; }
+.tap { width: 100%; margin-top: 4px; }
+.tap.armed { background: #fff; color: #111; }
+.fields { display: flex; flex-direction: column; gap: 6px; }
+.fields input { font: inherit; font-size: 13px; color: var(--fg); background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.1); border-radius: 9px; padding: 8px 10px; outline: none; }
+.fields input:focus { border-color: rgba(255,255,255,.35); }
+.results { margin-top: 8px; overflow-y: auto; min-height: 0; flex: 1; scrollbar-width: thin; }
+.res { display: flex; gap: 8px; align-items: center; width: 100%; text-align: left; padding: 8px; border-radius: 9px; transition: background .15s; }
+.res:hover { background: rgba(255,255,255,.08); }
+.res.cur { background: rgba(255,255,255,.12); }
+.res .rt { flex: 1; min-width: 0; }
+.res .rt div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.res .rt div:last-child { font-size: 11.5px; color: var(--fg2); }
+.res .badge { font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 5px; background: var(--chip2); flex: none; }
+.res .badge.no { opacity: .55; }
+.empty-res { font-size: 12.5px; color: var(--fg2); padding: 8px 4px; }
+.stale { position: absolute; left: 8px; right: 8px; bottom: 8px; z-index: 7; display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 12px;
+	background: rgba(28,28,34,.96); box-shadow: 0 8px 30px rgba(0,0,0,.45), 0 0 0 1px rgba(255,255,255,.1) inset; font-size: 12.5px; line-height: 1.45; }
+.stale[hidden] { display: none; }
+.stale span { flex: 1; }
+.stale .btn { flex: none; }
+.toast { position: absolute; left: 50%; top: 62px; z-index: 6; transform: translate(-50%, -8px) scale(.96); opacity: 0; pointer-events: none;
+	padding: 6px 12px; border-radius: 999px; background: rgba(255,255,255,.92); color: #111; font-size: 12px; font-weight: 600; white-space: nowrap;
+	transition: transform .45s var(--spring), opacity .25s var(--ease); box-shadow: 0 4px 16px rgba(0,0,0,.25); }
+.toast.show { transform: translate(-50%, 0) scale(1); opacity: 1; }
+@media (prefers-reduced-motion: reduce) { .line, .dots, .pill, .sheet, .toast { transition-duration: .01s !important; } .dots.on, .skel i { animation: none !important; } }
+`;
+
+	// Phone edition: a dock fixed to the bottom of the screen (the key control above the lyrics
+	// card), or just a round button that opens it.
+	const CSS_MOB = `
+:host { position: fixed; left: 0; right: 0; bottom: 0; z-index: 2147483646; margin: 0; padding: 0 10px calc(10px + env(safe-area-inset-bottom, 0px)); pointer-events: none; }
+:host([hidden]) { display: none; }
+.keybar, .card, .fab { pointer-events: auto; }
+.keybar { margin: 0 0 8px; height: 48px; }
+.keybar .kb { width: 38px; height: 38px; font-size: 22px; line-height: 38px; }
+.keybar .kr, .keybar .kx { height: 32px; line-height: 32px; }
+.keybar .kx { border: 0; border-radius: 16px; padding: 0 10px; color: inherit; background: rgba(255,255,255,.14); font: 600 14px/32px system-ui, sans-serif; }
+.card { height: min(48vh, 400px); }
+.card.collapsed { height: 56px; }
+.line { font-size: 21px; }
+.unsynced .line { font-size: 18px; }
+.icon { width: 40px; height: 40px; }
+.viewport { touch-action: none; }
+.fields input { font-size: 16px; }
+.btn { padding: 10px 16px; }
+.fab { position: absolute; right: calc(12px + env(safe-area-inset-right, 0px)); bottom: calc(14px + env(safe-area-inset-bottom, 0px)); width: 52px; height: 52px; border-radius: 50%; color: #fff; display: none;
+	align-items: center; justify-content: center; background: linear-gradient(180deg, rgba(58,58,66,.96), rgba(30,30,34,.96)); box-shadow: 0 6px 18px rgba(0,0,0,.4), 0 0 0 1px rgba(255,255,255,.1) inset;
+	font: 700 16px/1 system-ui, sans-serif; font-variant-numeric: tabular-nums; opacity: .9; }
+.fab.changed { background: linear-gradient(180deg, rgba(104,98,232,.97), rgba(76,70,196,.97)); }
+.fab:active { transform: scale(.92); }
+:host(.closed) .keybar, :host(.closed) .card { display: none; }
+:host(.closed) .fab { display: flex; }
+:host([data-keyonly]) .card { display: none; }
+@media (max-height: 460px) { .card { display: none; } }
+`;
+
+	const ICON = {
+		timing: '<svg viewBox="0 0 24 24"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5M9.5 2.5h5"/></svg>',
+		search: '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.2-4.2"/></svg>',
+		chevron: '<svg viewBox="0 0 24 24"><path d="M6 15l6-6 6 6"/></svg>',
+		down: '<svg viewBox="0 0 24 24"><path d="M12 5v14M6 13l6 6 6-6"/></svg>',
+	};
+
+	function build() {
+		// (a panel left on the page by the script of the version before an update; one of a
+		// version before 1.4.1 means its scripts are still running in the page, and cannot be
+		// stopped from here: a reload is asked for)
+		for (const old of document.querySelectorAll('#kc-lyrics')) {
+			if (!old.hasAttribute('data-kc-v')) S.stalePage = true;
+			old.remove();
+		}
+		host = document.createElement('div');
+		host.id = 'kc-lyrics';
+		host.setAttribute('data-kc-v', '2');
+		root = host.attachShadow({ mode: 'open' });
+		setHTML(root, `<style>${CSS}${MOB ? CSS_MOB : ''}</style>
+<div class="keybar" id="keybar">
+	<span class="kl"></span>
+	<button class="kb" id="keyDown" aria-label="">&minus;</button>
+	<span class="kv"><span id="keyVal" class="num">0</span></span>
+	<button class="kb" id="keyUp" aria-label="">+</button>
+	<button class="kr" id="keyReset" hidden></button>
+	<button class="ku" id="keyUpd" hidden></button>
+	<span class="kh" id="keyHint"></span>
+	${MOB ? '<button class="kx" id="keyClose" aria-label="close">&times;</button>' : ''}
+</div>
+${MOB ? '<button class="fab" id="fab" aria-label="key"><span id="fabVal">\u266a</span></button>' : ''}
+<div class="card" part="card">
+	<div class="bg a"></div><div class="bg b"></div>
+	<header>
+		<div class="art"></div>
+		<div class="meta"><div class="t"></div><div class="s"></div></div>
+		<button class="icon" id="timing">${ICON.timing}</button>
+		<button class="icon" id="search">${ICON.search}</button>
+		<button class="icon" id="collapse">${ICON.chevron}</button>
+	</header>
+	<div class="viewport"><div class="lines"></div><div class="status"></div></div>
+	<button class="pill" id="back">${ICON.down}<span></span></button>
+	<div class="sheet" id="timingSheet">
+		<h3><span></span><button data-close></button></h3>
+		<div class="seg"><button class="btn" data-nudge="-0.5"></button><button class="btn" data-nudge="0.5"></button></div>
+		<div class="off"></div>
+		<button class="btn tap" id="tap"></button>
+		<p class="hint" id="aiHint"></p>
+		<button class="btn tap" id="diag"></button>
+		<p class="hint" id="diagHint"></p>
+	</div>
+	<div class="sheet" id="searchSheet">
+		<h3><span></span><button data-close></button></h3>
+		<form class="fields"><input name="title" autocomplete="off"><input name="artist" autocomplete="off"><button class="btn primary" type="submit"></button></form>
+		<div class="results"></div>
+	</div>
+	<div class="toast"></div>
+	<div class="stale" hidden><span></span><button class="btn primary"></button></div>
+</div>`);
+		$ = (s) => root.querySelector(s);
+		$('#timing').title = msg('lyricsTiming');
+		$('#search').title = msg('lyricsSearch');
+		$('#collapse').title = msg('lyricsCollapse');
+		$('#back span').textContent = msg('lyricsBack');
+		$('#timingSheet h3 span').textContent = msg('lyricsTiming');
+		$('#searchSheet h3 span').textContent = msg('lyricsSearch');
+		for (const b of root.querySelectorAll('[data-close]')) b.textContent = msg('lyricsDone');
+		$('[data-nudge="-0.5"]').textContent = msg('lyricsEarlier');
+		$('[data-nudge="0.5"]').textContent = msg('lyricsLater');
+		$('#tap').textContent = msg('lyricsTapSync');
+		$('form input[name=title]').placeholder = msg('lyricsSongName');
+		$('form input[name=artist]').placeholder = msg('lyricsArtistName');
+		$('form button').textContent = msg('lyricsSearchBtn');
+
+		// ---- the key, changed here (same effect as the popup / the shortcuts)
+		$('#keybar .kl').textContent = msg('pageKeyLabel');
+		$('#keyDown').setAttribute('aria-label', msg('pageKeyDown'));
+		$('#keyUp').setAttribute('aria-label', msg('pageKeyUp'));
+		$('#keyReset').textContent = msg('pageKeyReset');
+		$('#keyHint').textContent = msg('pageKeyInactive');
+		$('#keyUpd').textContent = msg('pageKeyUpdate');
+		$('#keyUpd').addEventListener('click', () => send({ type: 'open-update' }));
+		$('.stale span').textContent = msg('lyricsReloadPage');
+		$('.stale button').textContent = msg('lyricsReloadBtn');
+		$('.stale button').addEventListener('click', () => {
+			// (back to the same moment of the video)
+			const u = new URL(location.href);
+			if (video && isWatch() && video.currentTime > 2) u.searchParams.set('t', Math.floor(video.currentTime) + 's');
+			location.replace(u.href);
+		});
+		$('#keyDown').addEventListener('click', () => stepKey(-1));
+		$('#keyUp').addEventListener('click', () => stepKey(1));
+		$('#keyReset').addEventListener('click', () => setKey(0));
+		refreshKey();
+		if (MOB) buildDock();
+		$('#collapse').addEventListener('click', () => {
+			S.collapsed = !S.collapsed;
+			$('.card').classList.toggle('collapsed', S.collapsed);
+			savePanel();
+			if (!S.collapsed) requestAnimationFrame(() => { measure(); place(true); });
+		});
+		$('#timing').addEventListener('click', () => toggleSheet('timingSheet'));
+		$('#search').addEventListener('click', () => toggleSheet('searchSheet'));
+		for (const b of root.querySelectorAll('[data-close]')) b.addEventListener('click', () => toggleSheet(null));
+		for (const b of root.querySelectorAll('[data-nudge]')) b.addEventListener('click', () => nudge(Number(b.dataset.nudge)));
+		$('#diag').textContent = msg('lyricsDiag');
+		$('#diagHint').textContent = msg('lyricsDiagHint');
+		$('#diag').addEventListener('click', saveDiagnostics);
+		$('#tap').addEventListener('click', () => {
+			S.tapSync = !S.tapSync;
+			$('#tap').classList.toggle('armed', S.tapSync);
+			$('#tap').textContent = msg(S.tapSync ? 'lyricsTapNow' : 'lyricsTapSync');
+		});
+		$('form').addEventListener('submit', (e) => {
+			e.preventDefault();
+			manualSearch();
+		});
+		$('#back').addEventListener('click', () => endManual());
+		const vp = $('.viewport');
+		vp.addEventListener('wheel', (e) => {
+			if (!S.synced || S.status !== 'ready') return;
+			e.preventDefault();
+			if (!S.manual) S.manualY = S.scrollY || 0;
+			S.manualY = Math.max(0, Math.min(maxScroll(), S.manualY + e.deltaY));
+			S.manualUntil = performance.now() + 5000;
+			setManual(true);
+			applyScroll(false);
+			clearTimeout(S.manualTimer);
+			S.manualTimer = setTimeout(endManual, 5000);
+		}, { passive: false });
+		if (MOB) touchScroll(vp);
+		$('.lines').addEventListener('click', (e) => {
+			const el = e.target.closest('.line');
+			if (!el || !S.synced || dragged) return;
+			const i = Number(el.dataset.i);
+			const line = S.items && S.items[i];
+			if (!line || line.t == null || line.dots) return;
+			if (S.tapSync) return tapSyncTo(line);
+			seekTo(line.t);
+		});
+		const ro = new ResizeObserver(() => { measure(); place(true); });
+		ro.observe(vp);
+		const io = new IntersectionObserver((es) => {
+			visible = es[es.length - 1].isIntersecting;
+			if (visible) { measure(); place(true); }
+		});
+		io.observe(host);
+		observers.push(ro, io);
+	}
+
+	// ---- phone edition: the dock opens from a round button, the lyrics scroll by touch
+	let dragged = false;
+	function buildDock() {
+		const setOpen = (on) => {
+			host.classList.toggle('closed', !on);
+			chrome.storage.local.set({ mobOpen: on });
+			if (on) requestAnimationFrame(() => { measure(); place(true); });
+		};
+		chrome.storage.local.get('mobOpen').then((o) => host.classList.toggle('closed', o.mobOpen !== true));
+		$('#fab').addEventListener('click', () => setOpen(true));
+		$('#keyClose').addEventListener('click', () => setOpen(false));
+		MOB.onFullscreen((on) => { host.hidden = on; });
+	}
+	function touchScroll(vp) {
+		let y0 = 0, base = 0, on = false;
+		vp.addEventListener('touchstart', (e) => {
+			dragged = false;
+			if (!S.synced || S.status !== 'ready' || e.touches.length !== 1) return;
+			on = true;
+			y0 = e.touches[0].clientY;
+			base = S.manual ? S.manualY : S.scrollY || 0;
+		}, { passive: true });
+		vp.addEventListener('touchmove', (e) => {
+			if (!on) return;
+			const dy = y0 - e.touches[0].clientY;
+			if (!dragged && Math.abs(dy) < 8) return;
+			dragged = true;
+			e.preventDefault();
+			S.manualY = Math.max(0, Math.min(maxScroll(), base + dy));
+			S.manualUntil = performance.now() + 5000;
+			setManual(true);
+			applyScroll(false);
+			clearTimeout(S.manualTimer);
+			S.manualTimer = setTimeout(endManual, 5000);
+		}, { passive: false });
+		const end = () => { on = false; setTimeout(() => { dragged = false; }, 60); };
+		vp.addEventListener('touchend', end, { passive: true });
+		vp.addEventListener('touchcancel', end, { passive: true });
+	}
+
+	function toggleSheet(id) {
+		for (const s of root.querySelectorAll('.sheet')) s.classList.toggle('show', s.id === id && !s.classList.contains('show'));
+		$('#timing').classList.toggle('on', $('#timingSheet').classList.contains('show'));
+		$('#search').classList.toggle('on', $('#searchSheet').classList.contains('show'));
+		if (id === 'searchSheet' && $('#searchSheet').classList.contains('show')) prepareSearch();
+		if (id === 'timingSheet') {
+			showOffset();
+			$('#aiHint').textContent = MOB ? msg('mobAiHint') : !S.capturing ? msg('lyricsAiOffHint') : S.mapSource === 'user' ? msg('lyricsAiUserHint') : msg('lyricsAiOnHint');
+		}
+		if (!$('#timingSheet').classList.contains('show') && S.tapSync) $('#tap').click();
+	}
+
+	let toastTimer = 0;
+	function toast(t) {
+		if (!root) return;
+		const el = $('.toast');
+		el.textContent = t;
+		el.classList.add('show');
+		clearTimeout(toastTimer);
+		toastTimer = setTimeout(() => el.classList.remove('show'), 2200);
+	}
+
+	// ---------------------------------------------------------------- diagnostics
+	// A file with everything the timing worked from (the singing activity, what was recognised,
+	// the lyrics lines, what the panel showed), to be replayed and tuned offline. Saved on the
+	// computer only; nothing is sent anywhere.
+	async function saveDiagnostics() {
+		const f = S.follower;
+		// (what the audio analysis did: speech recognition runs and errors)
+		const analysis = await send({ type: 'diag-status' });
+		const data = {
+			analysis,
+			kind: 'natural-key-changer-diagnostics', version: chrome.runtime.getManifest().version, savedAt: new Date().toISOString(),
+			video: { id: S.videoId, title: S.meta && S.meta.title, channel: S.meta && S.meta.channel, duration: S.meta && S.meta.duration, isCover: S.meta && S.meta.isCover },
+			lyrics: S.rec && { id: S.rec.id, trackName: S.rec.trackName, artistName: S.rec.artistName, duration: S.rec.duration, source: S.rec.source || 'database', version: !!S.rec.version },
+			status: S.status, mapSource: S.mapSource, audioDelay: S.audioDelay, capturing: S.capturing, ai: S.ai, need: needSent, shed: S.shedLog || [], switched: S.switchLog || [],
+			lines: S.lines.map((l) => ({ t: l.t, text: l.text })),
+			map: S.map.toJSON(),
+			tracker: f && { opts: f.opts, solved: f.solved && { tempo: f.solved.tempo, margin: f.solved.margin, offset: f.solved.offset }, segs: f.segs, anchors: f.anchorsExt },
+			heard: (S.heardSegs || []).slice(-200).map((x) => ({ m: +x.m.toFixed(2), d: +x.d.toFixed(2), text: x.text, lp: +x.logprob.toFixed(2) })),
+			asrLog: S.asrLog || [],
+			shown: S.shownLog || [], // [media time, line index, lyrics time]
+			alts: (S.alts || []).map((a) => ({ id: a.rec.id, score: +a.score.toFixed(2), n: a.n })),
+		};
+		const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
+		const a = document.createElement('a');
+		a.href = URL.createObjectURL(blob);
+		a.download = `kc-diagnostics-${S.videoId || 'video'}.json`;
+		document.body.append(a);
+		a.click();
+		a.remove();
+		setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+		toast(msg('lyricsDiagSaved'));
+	}
+
+	// ---------------------------------------------------------------- key control
+	const K = { value: 0, active: false, timer: 0, at: 0, pending: false, seq: 0, hint: '' };
+	function paintKey(animate) {
+		if (!root) return;
+		const el = $('#keyVal');
+		const txt = (K.value > 0 ? '+' : K.value < 0 ? '\u2212' : '') + Math.abs(K.value);
+		if (el.textContent !== txt) {
+			el.textContent = txt;
+			if (animate) { el.classList.remove('tick'); void el.offsetWidth; el.classList.add('tick'); }
+		}
+		$('#keybar').classList.toggle('off', !K.active);
+		$('#keyReset').hidden = !K.active || K.value === 0;
+		$('#keyDown').disabled = K.active && K.value <= -12;
+		$('#keyUp').disabled = K.active && K.value >= 12;
+		$('#keybar').classList.toggle('changed', K.active && K.value !== 0);
+		if (MOB) {
+			$('#fabVal').textContent = K.active && K.value !== 0 ? txt : '\u266a';
+			$('#fab').classList.toggle('changed', K.active && K.value !== 0);
+			$('#keyHint').textContent = K.hint || msg('pageKeyInactive');
+		}
+	}
+	async function refreshKey() {
+		// a new version is waiting (taken by itself when the extension's folder is set up)
+		try {
+			const { updateAvailable } = await chrome.storage.local.get('updateAvailable');
+			const mine = chrome.runtime.getManifest().version;
+			if (root) $('#keyUpd').hidden = !(updateAvailable && updateAvailable.version !== mine);
+		} catch (e) { /* page outlived the extension */ }
+		if (K.pending) return;
+		const r = await send({ type: 'key-get' });
+		if (!r || K.pending) return;
+		K.active = !!r.active;
+		K.hint = r.hint || '';
+		K.value = r.semitones || 0;
+		K.at = performance.now();
+		paintKey(false);
+	}
+	function stepKey(d) {
+		if (MOB) MOB.gesture(); // (the sound can only be started from inside a tap)
+		if (!K.active) return hintKey();
+		setKey(Math.max(-12, Math.min(12, K.value + d)));
+	}
+	// shown at once; the last value is sent after a short pause (fast clicking = one change)
+	function setKey(v) {
+		if (MOB) MOB.gesture();
+		if (!K.active) return hintKey();
+		K.value = v;
+		K.pending = true;
+		const mine = ++K.seq;
+		paintKey(true);
+		clearTimeout(K.timer);
+		K.timer = setTimeout(async () => {
+			const r = await send({ type: 'key-set', value: K.value });
+			// (a newer change was made while this one was being applied: its answer counts, not this)
+			if (mine !== K.seq) return;
+			K.pending = false;
+			K.hint = r && r.hint || '';
+			if (r && r.ok) { K.value = r.semitones; K.active = true; }
+			else if (r && r.active === false) { K.active = false; if (MOB) K.value = 0; }
+			else if (MOB && r && r.hint) { K.hint = r.hint; hintKey(); } // (phone: waiting for a tap)
+			K.at = performance.now();
+			paintKey(false);
+		}, MOB ? 40 : 120);
+	}
+	function hintKey() {
+		const bar = $('#keybar');
+		bar.classList.add('hint');
+		clearTimeout(K.hintTimer);
+		K.hintTimer = setTimeout(() => bar.classList.remove('hint'), 4000);
+	}
+
+	function mount() {
+		if (!alive()) return retire();
+		if (!S.enabled || !(isWatch() || dockPage())) return unmount();
+		const parent = MOB ? document.body : qs('#secondary-inner') || qs('#secondary');
+		if (!parent) return;
+		if (!host) build();
+		// (the script of a version before an update may put its own panel back on navigation)
+		for (const h of document.querySelectorAll('#kc-lyrics')) if (h !== host) h.remove();
+		if (MOB) {
+			host.toggleAttribute('data-keyonly', !isWatch());
+			if (host.parentElement !== parent) parent.append(host);
+			return;
+		}
+		if (host.parentElement !== parent || parent.firstElementChild !== host) parent.prepend(host);
+	}
+
+	function unmount() {
+		if (host) host.remove();
+	}
+
+	// ---------------------------------------------------------------- rendering
+	function setHeader() {
+		const r = S.rec;
+		$('.meta .t').textContent = r ? r.trackName : S.meta ? S.meta.title : '';
+		const sub = $('.meta .s');
+		sub.textContent = '';
+		if (S.status === 'live') {
+			const b = document.createElement('b');
+			b.textContent = msg('lyricsLiveTag');
+			sub.append(b, msg('lyricsLiveSub'));
+		} else if (r) {
+			if (S.capturing && S.follower && S.mapSource !== 'user') {
+				const ai = document.createElement('i');
+				ai.className = 'ai';
+				ai.textContent = 'AI';
+				ai.title = msg('lyricsAiBadge');
+				sub.append(ai);
+			}
+			if (r.source) {
+				const b = document.createElement('b');
+				b.textContent = msg(r.source === 'description' ? 'lyricsFromDescription' : 'lyricsFromComment');
+				sub.append(b);
+			}
+			if (S.plain || S.estimated || r.version) {
+				const b = document.createElement('b');
+				b.textContent = msg('lyricsEstimated');
+				b.title = msg('lyricsEstimatedHint');
+				sub.append(b);
+			}
+			if (S.meta && S.meta.isCover) {
+				const b = document.createElement('b');
+				b.textContent = msg('lyricsCoverTag');
+				sub.append(b);
+			}
+			sub.append(r.artistName || '');
+		} else sub.textContent = S.meta ? S.meta.channel : '';
+		const id = S.videoId;
+		$('.art').style.backgroundImage = id ? `url("https://i.ytimg.com/vi/${id}/default.jpg")` : '';
+	}
+
+	function setStatus(kind) {
+		const el = $('.status');
+		el.textContent = '';
+		el.classList.toggle('show', !!kind);
+		if (!kind) return;
+		if (kind === 'searching') {
+			setHTML(el, '<div class="skel"><i></i><i></i><i></i><i></i></div>');
+			return;
+		}
+		const box = document.createElement('div');
+		const big = document.createElement('div');
+		big.className = 'big';
+		const small = document.createElement('div');
+		small.className = 'small';
+		const row = document.createElement('div');
+		row.className = 'row';
+		if (kind === 'notfound') {
+			big.textContent = msg('lyricsNotFound');
+			small.textContent = msg(S.listening ? 'lyricsListeningHint' : 'lyricsNotFoundHint');
+			const b = document.createElement('button');
+			b.className = 'btn primary';
+			b.textContent = msg('lyricsSearch');
+			b.onclick = () => toggleSheet('searchSheet');
+			row.append(b);
+		} else if (kind === 'error') {
+			big.textContent = msg('lyricsError');
+			small.textContent = msg('lyricsErrorHint');
+			const b = document.createElement('button');
+			b.className = 'btn';
+			b.textContent = msg('lyricsRetry');
+			b.onclick = () => load(true);
+			row.append(b);
+		}
+		box.append(big, small, row);
+		el.append(box);
+	}
+
+	function render() {
+		const box = $('.lines');
+		box.textContent = '';
+		$('.card').classList.toggle('unsynced', !S.synced);
+		const frag = document.createDocumentFragment();
+		const items = mergedLines();
+		S.items = items;
+		items.forEach((line, i) => {
+			if (line.dots) {
+				const d = document.createElement('div');
+				d.className = 'dots';
+				d.dataset.i = i;
+				setHTML(d, '<i></i><i></i><i></i>');
+				frag.append(d);
+				return;
+			}
+			const el = document.createElement('div');
+			el.className = 'line' + (line.text ? '' : ' empty') + (line.live ? ' live' : '');
+			el.dataset.i = i;
+			if (line.words && line.words.length) {
+				for (const w of line.words) {
+					const s = document.createElement('span');
+					s.className = 'w';
+					s.textContent = w.text;
+					el.append(s);
+				}
+			} else el.textContent = line.text;
+			if (line.live && S.status === 'ready') {
+				// sung differently from the lyrics (in live transcription everything is heard)
+				const tag = document.createElement('span');
+				tag.className = 'tag';
+				tag.textContent = msg('lyricsHeardTag');
+				el.append(tag);
+			}
+			frag.append(el);
+		});
+		box.append(frag);
+		S.lineEls = [...box.children];
+		S.idx = -2;
+		measure();
+		place(true);
+	}
+
+	// lyrics lines + interlude markers + lines heard but not in the lyrics, in time order
+	function mergedLines() {
+		const out = [];
+		const L = S.lines;
+		if (!S.synced) return L.map((l) => ({ ...l }));
+		const first = L.find((l) => l.text);
+		if (first && first.t >= KCL_INTERLUDE) out.push({ dots: true, t: 0, end: first.t });
+		for (let i = 0; i < L.length; ++i) {
+			const l = L[i];
+			if (!l.text) {
+				const next = L[i + 1];
+				if (next && next.t - l.t >= KCL_INTERLUDE * 0.6) out.push({ dots: true, t: l.t, end: next.t });
+				continue;
+			}
+			out.push(l);
+		}
+		// heard-only lines: placed by their (mapped) lyrics time
+		for (const h of S.live) out.push({ t: S.map.toLyrics(h.m), end: S.map.toLyrics(h.m) + h.d, text: h.text, live: true });
+		out.sort((a, b) => a.t - b.t || (a.dots ? -1 : 1));
+		for (let i = 0; i < out.length; ++i) if (!out[i].dots) out[i].end = Math.min(out[i].end ?? Infinity, out[i + 1] ? out[i + 1].t : Infinity);
+		return out;
+	}
+	const KCL_INTERLUDE = 5;
+
+	function measure() {
+		if (!S.lineEls) return;
+		positions = S.lineEls.map((el) => el.offsetTop);
+		S.contentH = S.lineEls.length ? S.lineEls[S.lineEls.length - 1].offsetTop + S.lineEls[S.lineEls.length - 1].offsetHeight : 0;
+	}
+	const viewH = () => (root ? $('.viewport').clientHeight : 300);
+	const maxScroll = () => Math.max(0, (S.contentH || 0) - viewH() * 0.4);
+
+	// where the scroll should be for the active item: about a third from the top
+	function targetY(i) {
+		if (i < 0 || !positions.length) return 0;
+		return Math.max(0, positions[Math.min(i, positions.length - 1)] - viewH() * 0.3);
+	}
+
+	function applyScroll(stagger) {
+		const els = S.lineEls || [];
+		const y = S.manual ? S.manualY : S.scrollY || 0;
+		const active = S.idx;
+		for (let k = 0; k < els.length; ++k) {
+			const el = els[k];
+			const dist = k - Math.max(0, active);
+			// lines below the active one follow a little later: the "wave" of Apple Music
+			const delay = stagger && dist >= -1 && dist <= 9 ? Math.max(0, dist + 1) * 0.045 : 0;
+			const tf = `translate3d(0, ${-y}px, 0)`;
+			el.style.transitionDelay = delay ? `${delay}s, 0s, 0s` : '';
+			el.style.transform = k === active && !S.manual && !el.classList.contains('dots') ? tf : `${tf} scale(${el.classList.contains('dots') ? 1 : 0.97})`;
+			el.style.setProperty('--tf', tf);
+		}
+	}
+
+	function setManual(on) {
+		if (S.manual === on) return;
+		S.manual = on;
+		$('.card').classList.toggle('manual', on);
+		$('#back').classList.toggle('show', on);
+		if (!on) clearTimeout(S.manualTimer);
+	}
+	function endManual() {
+		setManual(false);
+		place(true, true);
+	}
+
+	// ---------------------------------------------------------------- timing
+	const heardMedia = () => (video ? video.currentTime - S.audioDelay : 0);
+	const followerOn = () => S.follower && S.mapSource !== 'user' && S.capturing;
+	function lyricsNow() {
+		const m = heardMedia();
+		if (followerOn() && S.horizon > 0) return S.follower.time(m, Math.max(m, S.horizon));
+		return S.map.toLyrics(m);
+	}
+
+	// sets the active item for the current time and schedules the next change
+	function place(force = false, stagger = false) {
+		clearTimeout(timer);
+		timer = 0;
+		if (!root || S.status !== 'ready' && S.status !== 'live' || !S.synced || !S.items) return;
+		const t = lyricsNow();
+		const items = S.items;
+		let i = -1;
+		for (let k = 0; k < items.length; ++k) if (items[k].t <= t + 0.02) i = k;
+		// an interlude whose end has come is over
+		if (i >= 0 && items[i].dots && t >= items[i].end) i = -1;
+		if (i !== S.idx && video) {
+			// (what the panel showed, to see afterwards where it was off)
+			const log = (S.shownLog = S.shownLog || []);
+			log.push([+heardMedia().toFixed(2), i, +t.toFixed(2)]);
+			if (log.length > 800) log.splice(0, log.length - 800);
+		}
+		if (i !== S.idx || force) {
+			const changed = i !== S.idx;
+			const prev = S.idx;
+			S.idx = i;
+			if (visible) paint(prev, i, t, changed && !force);
+			S.scrollY = targetY(i < 0 ? 0 : i);
+			if (visible && !S.manual) applyScroll(changed || stagger);
+		}
+		if (!video || video.paused) return;
+		// next boundary: next item start (or the end of the current interlude)
+		let next = Infinity;
+		if (i + 1 < items.length) next = items[i + 1].t;
+		if (i >= 0 && items[i].dots) next = Math.min(next, items[i].end);
+		if (!isFinite(next)) return;
+		const rate = (video.playbackRate || 1) * Math.max(0.25, S.map.rate(heardMedia()));
+		let ms = Math.max(15, ((next - t) / rate) * 1000);
+		// while the follower holds a line for the singer, look again shortly
+		if (followerOn() && S.follower.holding) ms = Math.min(ms, 120);
+		timer = setTimeout(() => place(), Math.min(ms, 30000));
+	}
+
+	function paint(prev, i, t, animate) {
+		const els = S.lineEls;
+		const items = S.items;
+		for (let k = 0; k < els.length; ++k) {
+			const el = els[k];
+			const on = k === i;
+			el.classList.toggle('on', on);
+			el.classList.toggle('past', k < i);
+			el.classList.toggle('near', k === i + 1);
+		}
+		const cur = els[i];
+		if (cur && items[i].dots) {
+			const it = items[i];
+			cur.style.setProperty('--gap', `${Math.max(1, it.end - it.t)}s`);
+			// the dots fill one after the other over the length of the gap, from where we are now
+			const total = Math.max(1, it.end - it.t), done = Math.max(0, t - it.t);
+			cur.querySelectorAll('i').forEach((d, n) => {
+				d.style.animationDuration = `${total / 3}s`;
+				d.style.animationDelay = `${(n * total) / 3 - done}s`;
+			});
+		}
+		if (cur && items[i].words) {
+			// word fills, timed by CSS from "now"
+			const rate = video ? video.playbackRate || 1 : 1;
+			cur.querySelectorAll('.w').forEach((s, n) => {
+				const w = items[i].words[n];
+				const end = w.end != null ? w.end : n + 1 < items[i].words.length ? items[i].words[n + 1].t : items[i].end;
+				s.style.setProperty('--dl', `${(w.t - t) / rate}s`);
+				s.style.setProperty('--d', `${Math.max(0.05, (end - w.t) / rate)}s`);
+			});
+		}
+		void prev;
+		void animate;
+	}
+
+	function seekTo(lyricsT) {
+		if (!video) return;
+		// (a part the version sings twice: the next time it comes, from about now)
+		const m = S.map.toMedia(lyricsT, heardMedia() - 20, true) + S.audioDelay;
+		video.currentTime = Math.max(0, m - 0.15);
+		if (video.paused) video.play().catch(() => {});
+		endManual();
+	}
+
+	// ---------------------------------------------------------------- user timing corrections
+	function nudge(d) {
+		// positive = lyrics later (the words come later than shown)
+		const a = S.map.a.length ? S.map.a.map((p) => ({ m: p.m, l: p.l - d })) : [{ m: 0, l: -d }];
+		S.map.set(a);
+		S.mapSource = 'user';
+		saveTiming();
+		showOffset();
+		place(true);
+	}
+
+	function tapSyncTo(line) {
+		// the line the user taps is being sung now (minus a typical reaction time)
+		const now = heardMedia() - 0.25;
+		const shift = line.t - S.map.toLyrics(now);
+		S.map.set(S.map.a.length ? S.map.a.map((p) => ({ m: p.m, l: p.l - shift })) : [{ m: 0, l: -shift }]);
+		S.mapSource = 'user';
+		S.tapSync = false;
+		$('#tap').classList.remove('armed');
+		$('#tap').textContent = msg('lyricsTapSync');
+		saveTiming();
+		showOffset();
+		toast(msg('lyricsSynced'));
+		place(true);
+	}
+
+	function showOffset() {
+		if (!root) return;
+		// lyrics time - media time around now: >0 = lyrics shown earlier than the recording
+		const off = S.map.toLyrics(heardMedia()) - heardMedia() + (S.rec && S.rec.baseShift || 0);
+		const r = Math.round(off * 10) / 10;
+		$('.off').textContent = Math.abs(r) < 0.05 ? msg('lyricsOffsetZero') : msg(r > 0 ? 'lyricsOffsetEarlier' : 'lyricsOffsetLater', String(Math.abs(r).toFixed(1)));
+	}
+
+	// ---------------------------------------------------------------- storage (per video)
+	// What is kept per video (the timing, a chosen record, what was heard): one storage item per
+	// video ("lp:<id>"), so saving one video's timing writes only that (it was one big object of
+	// all 300 videos, several MB, rewritten every few seconds - a hitch for the page each time).
+	// An index of when each was last used keeps the most recent 300.
+	const PREFS_OLD = 'lyricsPrefs', PREFS_INDEX = 'lyricsPrefsIndex';
+	const prefKey = (id) => 'lp:' + id;
+	async function loadPrefs() {
+		try {
+			const key = prefKey(S.videoId);
+			const o = await chrome.storage.local.get([key, 'lyricsPanel']);
+			S.collapsed = !!(o.lyricsPanel && o.lyricsPanel.collapsed);
+			return o[key] || null;
+		} catch (e) {
+			return null;
+		}
+	}
+	let prefWrite = Promise.resolve();
+	function savePref(patch) {
+		const id = S.videoId;
+		if (!alive() || !id) return Promise.resolve();
+		// (one after the other: two quick saves must not overwrite each other's fields)
+		prefWrite = prefWrite.then(async () => {
+			if (!alive()) return;
+			const key = prefKey(id);
+			const o = await chrome.storage.local.get([key, PREFS_INDEX]);
+			const index = o[PREFS_INDEX] || {};
+			const at = Date.now();
+			index[id] = at;
+			const ids = Object.keys(index);
+			const drop = ids.length > 300 ? ids.sort((a, b) => index[a] - index[b]).slice(0, ids.length - 300) : [];
+			for (const d of drop) delete index[d];
+			await chrome.storage.local.set({ [key]: { ...(o[key] || {}), ...patch, at }, [PREFS_INDEX]: index });
+			if (drop.length) await chrome.storage.local.remove(drop.map(prefKey));
+		}).catch(() => {});
+		return prefWrite;
+	}
+	// (written at most every 10 s while it follows the singing: storage writes are not free)
+	let timingTimer = 0, timingAt = 0;
+	// (timing found automatically is kept for the next play only once recognised phrases agree
+	// with it: one guessed from the singing activity alone may be wrong, and would start the
+	// next play wrong)
+	const wordsAgree = () => !!(S.follower && S.follower.anchorsExt && S.follower.anchorsExt.filter((an) => an.w >= 0.5 && Math.abs(an.l - S.map.toLyrics(an.m)) < 0.8).length >= 3);
+	const saveTimingNow = () => { timingAt = Date.now(); timingTimer = 0; savePref({ map: S.map.toJSON(), mapSource: S.mapSource, recId: S.rec && S.rec.id, confirmed: S.mapSource === 'user' || wordsAgree() }); };
+	const saveTiming = () => {
+		if (S.mapSource === 'user' || Date.now() - timingAt > 10000) return saveTimingNow();
+		if (!timingTimer) timingTimer = setTimeout(saveTimingNow, 10000 - (Date.now() - timingAt));
+	};
+	const savePanel = () => alive() && chrome.storage.local.set({ lyricsPanel: { collapsed: S.collapsed } });
+
+	// ---------------------------------------------------------------- description & comments
+	// The full description and the top comments, the way the page gets them. Fetched only
+	// when the lyrics database has no timed lyrics, or the video is another version (cover…).
+	async function around(id, withComments) {
+		if (S.around && S.around.videoId === id && (S.around.comments || !withComments)) return S.around;
+		let info = S.around && S.around.videoId === id ? S.around.info : null;
+		if (!info) {
+			try {
+				const html = await (await fetch(`/watch?v=${encodeURIComponent(id)}`, { credentials: 'include' })).text();
+				// (read by the background: a megabyte of page data is a hitch for the video here)
+				const r = await send({ type: 'yt-parse', html });
+				info = r && typeof r === 'object' && 'description' in r ? r : KCL.ytData.parseWatch(html);
+			} catch (e) {
+				info = { description: '' };
+			}
+			// the description on the page itself, if the fetch gave nothing
+			if (!info.description) info.description = text(qs('ytd-watch-metadata #description-inline-expander')) || text(qs('#description'));
+		}
+		let comments = null;
+		if (withComments) {
+			try {
+				const post = (url, body) => fetch(url, { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then((r) => (r.ok ? r.json() : null));
+				comments = await KCL.ytData.fetchComments(info, post);
+			} catch (e) {
+				comments = [];
+			}
+			// comments already on the page count too
+			for (const el of document.querySelectorAll('ytd-comment-thread-renderer #content-text')) comments.push({ text: el.innerText || el.textContent || '', likes: 0, pinned: false });
+		}
+		S.around = { videoId: id, info, comments };
+		return S.around;
+	}
+
+	// Lyrics written in the description / the comments for this version, on the database's
+	// times:
+	//   - all of its lyrics, some lines changed or added (a RAP VERSION): the lines in both keep
+	//     the original's times, the new ones get time of their own
+	//   - only the part it adds (a rapper's verse over the original's interlude), introduced as
+	//     such ("ラップ", "rap", a name from the title): put into the interlude that fits it
+	async function versionLyrics(ar, timed) {
+		const T = KCL.textLyrics;
+		const texts = [{ text: ar.info.description || '', from: 'description', likes: 1e6 }].concat((ar.comments || []).slice(0, 80).map((c) => ({ ...c, from: 'comment' })));
+		const title = (S.meta && S.meta.title) || '';
+		// names in the title besides the song ("Reol(れをる)+nqrse Cover" -> nqrse)
+		const names = title.split(/[\s\/／+＋×&＆()（）【】\[\]「」『』]+/).map((x) => x.trim()).filter((x) => x.length >= 3 && !/cover|カバー|歌ってみた|version|ver\.?/i.test(x));
+		let full = null, part = null;
+		const all = [];
+		const whole = KCL.bigramsOf(timed.map((l) => l.text).join(''));
+		for (const c of texts) {
+			const p = T.plain(c.text);
+			if (!p || KCL.query.langMismatch(title, p.text)) continue;
+			// (the page keeps playing smoothly: one comment at a time)
+			await new Promise((r) => setTimeout(r, 0));
+			// nothing like the song at all and not introduced as a part of it: not these lyrics
+			const cue0 = /ラップ|ﾗｯﾌﾟ|rap|랩|パート|part/i.test(c.text);
+			if (!cue0 && KCL.fastSim(KCL.bigramsOf(p.text), whole) < 0.12) continue;
+			const plain = KCL.lrc.plain(p.text).lines;
+			const sk = KCL.PlainTimer.skeleton(plain, timed);
+			const own = sk.ownCount || 0;
+			if (sk.matched >= 0.3 && own >= 3 && sk.lines.length >= 6) {
+				const score = own + Math.log10(1 + (c.likes || 0));
+				const v = { score, lines: sk.lines, shift: sk.shift, from: c.from };
+				all.push(v);
+				if (!full || score > full.score) full = v;
+			} else if (sk.matched <= 0.2) {
+				const cue = /ラップ|ﾗｯﾌﾟ|rap|랩|パート|part/i.test(c.text) || names.some((n) => c.text.toLowerCase().includes(n.toLowerCase()) && !title.toLowerCase().startsWith(n.toLowerCase()));
+				if (!cue) continue;
+				const g = KCL.PlainTimer.fillGap(plain, timed);
+				const score = Math.log10(1 + (c.likes || 0));
+				const v = g && { score, lines: g.lines, shift: g.shift, from: c.from };
+				if (v) all.push(v);
+				if (v && (!part || score > part.score)) part = v;
+			}
+		}
+		const best = full || part;
+		return best && { ...best, all: all.filter((v) => v !== best).slice(0, 4) };
+	}
+
+	// ---------------------------------------------------------------- choosing while it plays
+	// The lyrics found (the database's, a comment's version, a comment's rap part...) are all
+	// kept; what the recogniser hears is compared with each, and if another one clearly fits
+	// what is sung better, the panel switches to it.
+	// others: records of other songs of the same name (they must prove themselves much more)
+	function setAlts(list, others = []) {
+		const otherIds = new Set(others.map((r) => r && r.id));
+		S.alts = [...list, ...others].filter(Boolean).map((rec) => {
+			const lines = KCL.lrc.parse(rec.syncedLyrics).lines.filter((l) => l.text);
+			const bg = [];
+			for (let i = 0; i < lines.length; ++i) {
+				bg.push(KCL.bigramsOf(lines[i].text));
+				if (i + 1 < lines.length) bg.push(KCL.bigramsOf(lines[i].text + lines[i + 1].text));
+			}
+			return { rec, bg, score: 0, n: 0, other: otherIds.has(rec.id) && !list.includes(rec) };
+		});
+		// the same text twice is one choice
+		S.alts = S.alts.filter((a, i) => !S.alts.slice(0, i).some((b) => b.rec.syncedLyrics === a.rec.syncedLyrics));
+		S.altLast = 0;
+	}
+
+	function checkAlts(segs) {
+		if (!S.alts || !S.alts.length || !S.rec) return;
+		let used = 0;
+		// (line-sized pieces: each one a separate piece of evidence)
+		for (const x of segs.flatMap((sg) => KCL.splitSegment(sg))) {
+			if (x.logprob < -0.9 || KCL.compact(x.text).length < 5 || KCL.isHallucination(x.text)) continue;
+			const sb = KCL.bigramsOf(x.text);
+			used++;
+			for (const a of S.alts) {
+				let m = 0;
+				for (const b of a.bg) { const v = KCL.fastSim(sb, b); if (v > m) m = v; }
+				a.score += Math.max(0, m - 0.35);
+				a.n++;
+			}
+		}
+		if (!used) return;
+		const cur = S.alts.find((a) => a.rec.id === S.rec.id);
+		let best = null;
+		for (const a of S.alts) if (!best || a.score > best.score) best = a;
+		// clearly sung words that fit none of the lyrics shown: perhaps the wrong song
+		if (cur && best === cur && cur.n >= 10 && cur.score < 0.35 && !S.warned) {
+			S.warned = true;
+			toast(msg('lyricsMismatch'));
+		}
+		if (S.alts.length < 2) return;
+		if (!cur || best === cur || performance.now() - S.altLast < 20000) return;
+		// Another song of the same name only when the lyrics shown clearly do not fit what is
+		// sung (a user's panel switched to another song in the middle of a song that went well:
+		// the recogniser's words fit another song's lines a little now and then), and never
+		// while recognised phrases keep confirming where the lyrics are
+		if (best.other) {
+			const inSync = S.follower && S.follower.anchorsExt && S.follower.anchorsExt.filter((an) => an.w >= 0.5 && Math.abs(an.l - S.map.toLyrics(an.m)) < 1).length >= 2;
+			const fitsNow = cur.n && cur.score / cur.n >= 0.12;
+			if (inSync || fitsNow || best.n < 10 || best.score < cur.score * 3 + 1.2 || best.score / best.n < 0.25) return;
+		}
+		if (best.n >= 4 && best.score - cur.score >= 0.8 && best.score >= cur.score * 1.6 + 0.2) {
+			S.altLast = performance.now();
+			(S.switchLog = S.switchLog || []).push({ m: video ? +video.currentTime.toFixed(1) : null, from: cur.rec.id, to: best.rec.id, other: !!best.other, cur: +cur.score.toFixed(2), best: +best.score.toFixed(2), n: best.n });
+			const carry = S.follower;
+			useRecord(best.rec, null, carry);
+			toast(msg('lyricsSwitched'));
+		}
+	}
+
+	// ---------------------------------------------------------------- loading
+	function useRecord(rec, prefs, carry = null) {
+		S.rec = rec;
+		S.plain = null;
+		let parsed = rec.syncedLyrics ? KCL.lrc.parse(rec.syncedLyrics) : KCL.lrc.plain(rec.plainLyrics);
+		if (!parsed.synced) {
+			// lyrics without times: timed from what the AI hears; a timing worked out on an
+			// earlier play is used right away
+			const key = KCL.compact(rec.plainLyrics || '').slice(0, 200);
+			if (prefs && prefs.plainTimed && prefs.plainKey === key) parsed = { lines: prefs.plainTimed.map((l) => ({ ...l })), synced: true, estimated: true };
+			else S.plain = new KCL.PlainTimer(parsed.lines);
+			S.plainKey = key;
+		}
+		S.lines = parsed.lines;
+		S.synced = parsed.synced;
+		S.live = [];
+		const keepMap = prefs && prefs.recId === rec.id && prefs.map && (prefs.mapSource === 'user' || prefs.confirmed);
+		S.map = KCL.TimeMap.from(keepMap ? prefs.map : []);
+		S.mapSource = keepMap && prefs.mapSource ? prefs.mapSource : 'none';
+		S.status = 'ready';
+		// the video's length against the recording's: a hint for a longer / shorter intro, and
+		// "same length" = most likely the very recording the lyrics were timed on
+		// (lyrics timed for this very video — its description, its comments, an earlier play —
+		// count as "the same recording" too)
+		// (a cover as long as the original is still a cover: its timing is its own)
+		const own = rec.forThisVideo || parsed.estimated;
+		const dLen = !own && rec.duration && S.meta && S.meta.duration ? rec.duration - S.meta.duration : 0;
+		const cover = !own && S.meta && S.meta.isCover;
+		// the tracker follows any version: another tempo, another structure (a cover that starts
+		// with the chorus), a cut, an insert
+		const wide = !!(S.meta && /rap|ラップ|랩|remix|リミックス|arrange|アレンジ|sped up|speed up|nightcore|倍速|ハイテンポ/i.test(S.meta.title || ''));
+		S.follower = S.synced ? new KCL.Tracker(S.lines, { hints: dLen ? [dLen] : [], wide, sameLength: own || (!cover && rec.duration && S.meta && S.meta.duration ? Math.abs(dLen) < 3 : false) }) : null;
+		S.estimated = !!parsed.estimated;
+		if (S.follower && S.map.a.length) S.follower.map = KCL.TimeMap.from(S.map.toJSON()); // timing learnt on an earlier play
+		// switching lyrics while it plays: what was heard so far is not lost
+		if (S.follower && carry) {
+			for (const sg of carry.segs || []) S.follower.add(sg.k0 * 0.1, sg.v);
+			if (S.heardSegs && S.heardSegs.length) for (const an of KCL.matchSegments(S.heardSegs.slice(-60), S.lines).anchors) S.follower.addAnchor(an.m, an.l, an.w, an);
+		}
+		S.horizon = -1;
+		S.announced = false;
+		S.lang = KCL.hasJapanese(S.lines.map((l) => l.text).join('')) ? 'ja' : KCL.hasHangul(S.lines.map((l) => l.text).join('')) ? 'ko' : null;
+		setHeader();
+		setStatus(null);
+		render();
+		place(true);
+		updateNeed(true);
+		window.dispatchEvent(new CustomEvent('kc-lyrics-loaded', { detail: { id: rec.id, synced: S.synced } }));
+		// tell the audio side what to listen for (alignment)
+		send({ type: 'lyrics-active', videoId: S.videoId, lyrics: S.lines.map((l) => ({ t: l.t, text: l.text })), synced: S.synced });
+	}
+
+	async function load(force = false) {
+		const gen = ++S.gen;
+		clearTimeout(timer);
+		S.rec = null;
+		S.lines = [];
+		S.items = [];
+		S.live = [];
+		S.map = new KCL.TimeMap();
+		S.follower = null;
+		S.plain = null;
+		S.estimated = false;
+		S.horizon = -1;
+		clock.length = 0;
+		S.heardSegs = [];
+		S.alts = null;
+		S.warned = false;
+		S.idx = -2;
+		S.status = 'searching';
+		S.videoId = currentId();
+		mount();
+		if (!root) return;
+		$('.card').classList.toggle('collapsed', S.collapsed);
+		$('.lines').textContent = '';
+		setManual(false);
+		toggleSheet(null);
+		setStatus('searching');
+		// What the video is. The page itself updates its title, its description and its
+		// "Music" section a while after moving to the next video (a mix, autoplay), so what it
+		// shows may still be the previous video's: the watch page's own data for this video id
+		// comes first, the page only fills in.
+		const id = S.videoId;
+		const fetched = Promise.race([around(id, false).catch(() => null), new Promise((r) => setTimeout(() => r(null), 4000))]);
+		let early = null;
+		fetched.then((x) => { early = x; });
+		let meta = readMeta();
+		// (no need to wait for the page once its data for this id is here)
+		for (let k = 0; k < 15 && (!meta.title || meta.title === S.lastTitle || !meta.duration) && !(early && early.info && early.info.title); ++k) {
+			await new Promise((r) => setTimeout(r, 200));
+			if (gen !== S.gen) return;
+			meta = readMeta();
+		}
+		const ar0 = await fetched;
+		if (gen !== S.gen) return;
+		const info = ar0 && ar0.info;
+		if (info && info.title && info.videoId === id) {
+			meta = { ...meta, title: info.title, channel: info.author || meta.channel, duration: info.lengthSeconds || meta.duration, music: info.music || null };
+			// credits in the description ("原曲：…", "作詞作曲：…") join the first search
+			const extra = KCL.textLyrics.credits(info.description);
+			// the original linked from the description: its title names the song
+			if (extra.links.length) {
+				const one = (vid) => fetch(`/oembed?format=json&url=${encodeURIComponent('https://www.youtube.com/watch?v=' + vid)}`).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+				const got = await Promise.race([Promise.all(extra.links.map(one)), new Promise((r) => setTimeout(() => r([]), 2500))]);
+				if (gen !== S.gen) return;
+				extra.videos = got.filter((x) => x && x.title).map((x) => ({ title: x.title, channel: x.author_name || '' }));
+			}
+			if (extra.songs.length || extra.artists.length || (extra.videos && extra.videos.length)) meta.extra = extra;
+		} else {
+			// the page alone: its "Music" section only when it is surely this video's
+			const flexy = qs('ytd-watch-flexy');
+			const pageId = flexy && flexy.getAttribute('video-id');
+			if (pageId !== id || meta.title === S.lastTitle) meta.music = null;
+		}
+		S.lastTitle = meta.title;
+		const prefs = await loadPrefs();
+		$('.card').classList.toggle('collapsed', S.collapsed);
+		if (gen !== S.gen) return;
+		S.meta = { ...meta, isCover: KCL.query ? KCL.query.parseVideo(meta).isCover : /歌ってみた|cover/i.test(meta.title) };
+		setHeader();
+		// (only a record the user picked is asked for again by its id; one found by the search is
+		// found again - by a better search after an update)
+		const res = await send({ type: 'lyrics-find', meta, prefer: prefs && prefs.chosen && prefs.recId, force });
+		if (gen !== S.gen) return;
+		if (!res || res.ok === false) {
+			S.status = 'error';
+			setStatus('error');
+			return;
+		}
+		S.candidates = res.candidates || [];
+		// The description and the comments: lyrics written for this very video (timed ones are
+		// the best there is for a cover), plain lyrics when nothing timed exists, and credits
+		// ("原曲：…") for another search
+		let alts = null;
+		const otherVersion = S.meta.isCover || /live|ライブ|arrange|アレンジ|remix|ver\.|version|弾き語り|acoustic|piano|ピアノ/i.test(S.meta.title || '');
+		const synced = res.best && res.best.syncedLyrics;
+		// a record found by the song name alone (the singer not confirmed): checked against
+		// lyrics written on the page itself, if there are any
+		// (only a record of the other databases, which know countless songs of every name: an
+		// LRCLIB record found by the song's name is these lyrics nearly always, and a cover's
+		// description is often a greeting, not lyrics - a user's cover lost its lyrics to one)
+		const unsure = !!(res.best && res.best.match && res.best.match.artistScore < 0.5 && /^(ne|qq):/.test(String(res.best.id)));
+		if (!synced || otherVersion || unsure) {
+			// (the comments too for other versions: someone may have written the lyrics as sung)
+			const ar = await around(S.videoId, !synced || otherVersion);
+			if (gen !== S.gen) return;
+			// (not text in another language than the video: a comment written for readers abroad)
+			const sameLang = (txt) => !KCL.query.langMismatch(S.meta.title, txt);
+			const found = KCL.ytData.lyricsAround(ar.info.description, ar.comments, sameLang);
+			let best = res.best;
+			if (!best) {
+				// search again with the credits of the description
+				const extra = KCL.textLyrics.credits(ar.info.description);
+				if (extra.songs.length || extra.artists.length) {
+					const again = await send({ type: 'lyrics-find', meta: { ...meta, extra }, force: true });
+					if (gen !== S.gen) return;
+					if (again && again.best) {
+						best = again.best;
+						S.candidates = again.candidates || S.candidates;
+					}
+				}
+			}
+			// the page's own lyrics read differently from the record's: the record is another
+			// song of that name
+			const textOf = (r) => (r.plainLyrics || (r.syncedLyrics ? KCL.lrc.parse(r.syncedLyrics).lines.map((l) => l.text).join('\n') : '')).slice(0, 1500);
+			// (lyrics, not a short excerpt: an excerpt of these lyrics is found inside them anyway)
+			const pageText = found ? found.text || (found.lines || []).map((l) => l.text).join('\n') : '';
+			if (unsure && best === res.best && pageText.split('\n').filter((x) => x.trim()).length >= 6 && KCL.fastSim(KCL.bigramsOf(pageText.slice(0, 1500)), KCL.bigramsOf(textOf(best))) < 0.2) best = null;
+			const name = { trackName: best ? best.trackName : S.meta.title, artistName: best ? best.artistName : S.meta.channel };
+			if (found && found.kind === 'timed' && (!best || !best.syncedLyrics || otherVersion)) {
+				res.best = { id: `yt-${found.from}:${S.videoId}`, ...name, duration: S.meta.duration, syncedLyrics: KCL.textLyrics.lrcOf(found.lines), source: found.from, forThisVideo: true };
+			} else if (best && best.syncedLyrics) {
+				res.best = best;
+				// lyrics written for this version (a description / a comment) that differ from the
+				// database's in part (changed lines, a verse of its own): their text, on the
+				// database's times where the lines are the same
+				if (otherVersion) {
+					const v = await versionLyrics(ar, KCL.lrc.parse(best.syncedLyrics).lines);
+					if (gen !== S.gen) return;
+					const asRec = (x) => ({ id: `yt-${x.from}:${S.videoId}:${x.score.toFixed(2)}`, ...name, duration: (best.duration || 0) + (x.shift || 0), syncedLyrics: KCL.textLyrics.lrcOf(x.lines), source: x.from, version: true });
+					if (v) res.best = asRec(v);
+					// the others stay as choices while it plays
+					alts = [res.best, best, ...(v ? v.all.map(asRec) : [])];
+				}
+			} else if (found && found.kind === 'plain' && (!best || !best.plainLyrics || KCL.dice(found.text, best.plainLyrics) >= 0.35)) {
+				// text from the description is only taken over the database's when it is these
+				// lyrics (perhaps as sung here), not some other block of text
+				res.best = { id: `yt-${found.from}:${S.videoId}`, ...name, duration: S.meta.duration, plainLyrics: found.text, source: found.from, forThisVideo: true };
+			} else res.best = best;
+		}
+		if (!res.best && prefs && prefs.live && prefs.live.length) {
+			// heard on an earlier play: show it right away, keep improving it
+			S.status = 'live';
+			S.synced = true;
+			S.lines = [];
+			S.live = prefs.live;
+			setHeader();
+			setStatus(null);
+			render();
+			place(true);
+			send({ type: 'lyrics-active', videoId: S.videoId, lyrics: null, synced: false });
+			updateNeed(true);
+			return;
+		}
+		if (!res.best) {
+			S.status = 'notfound';
+			setHeader();
+			setStatus('notfound');
+			send({ type: 'lyrics-active', videoId: S.videoId, lyrics: null, synced: false });
+			updateNeed(true);
+			return;
+		}
+		useRecord(res.best, prefs);
+		// other database records with timed lyrics that read differently (another song of that
+		// name, another version) are choices too
+		const others = (S.candidates || []).filter((c) => c.syncedLyrics && c.match && c.match.titleScore >= 0.7 && c.id !== res.best.id && !KCL.query.langMismatch(S.meta.title, c.syncedLyrics) && KCL.dice(c.syncedLyrics.slice(0, 600), (res.best.syncedLyrics || res.best.plainLyrics || '').slice(0, 600)) < 0.6).slice(0, 2);
+		setAlts(res.best.syncedLyrics ? alts || [res.best] : [], res.best.syncedLyrics ? others : []);
+	}
+
+	// ---------------------------------------------------------------- manual search
+	function prepareSearch() {
+		const f = $('form');
+		const p = S.meta && KCL.query ? KCL.query.parseVideo(S.meta) : null;
+		if (!f.title.value) f.title.value = S.rec ? S.rec.trackName : p && p.pairs[0] ? p.pairs[0].title : '';
+		if (!f.artist.value) f.artist.value = S.rec ? S.rec.artistName : p && p.pairs[0] ? p.pairs[0].artist : '';
+		showResults(S.candidates);
+	}
+
+	function showResults(list) {
+		const box = $('.results');
+		box.textContent = '';
+		if (!list || !list.length) {
+			const e = document.createElement('div');
+			e.className = 'empty-res';
+			e.textContent = msg('lyricsNoResults');
+			box.append(e);
+			return;
+		}
+		for (const c of list) {
+			const b = document.createElement('button');
+			b.className = 'res' + (S.rec && S.rec.id === c.id ? ' cur' : '');
+			const rt = document.createElement('div');
+			rt.className = 'rt';
+			const a = document.createElement('div'), s = document.createElement('div');
+			a.textContent = c.trackName;
+			const d = c.duration ? ` · ${Math.floor(c.duration / 60)}:${String(Math.round(c.duration % 60)).padStart(2, '0')}` : '';
+			s.textContent = (c.artistName || '') + d;
+			rt.append(a, s);
+			const badge = document.createElement('span');
+			badge.className = 'badge' + (c.syncedLyrics ? '' : ' no');
+			// (a record of another database whose lyrics are fetched when it is picked: its source)
+			badge.textContent = c.lazy ? (c.db === 'netease' ? 'NetEase' : 'QQ') : msg(c.syncedLyrics ? 'lyricsBadgeSynced' : 'lyricsBadgePlain');
+			b.append(rt, badge);
+			b.onclick = async () => {
+				const rec = c.syncedLyrics || c.plainLyrics ? c : await send({ type: 'lyrics-get', id: c.id });
+				// (a record whose lyrics turn out to be empty is not taken: the panel would go blank)
+				if (!rec || !(rec.syncedLyrics || rec.plainLyrics)) return toast(msg('lyricsNotFound'));
+				await savePref({ recId: rec.id, chosen: true, map: [], mapSource: 'none' });
+				send({ type: 'lyrics-choose', videoId: S.videoId, rec });
+				useRecord(rec, null);
+				toggleSheet(null);
+			};
+			box.append(b);
+		}
+	}
+
+	async function manualSearch() {
+		const f = $('form');
+		const box = $('.results');
+		setHTML(box, '<div class="skel"><i></i><i></i></div>');
+		const res = await send({ type: 'lyrics-search', title: f.title.value.trim(), artist: f.artist.value.trim(), duration: S.meta && S.meta.duration });
+		showResults(res && res.candidates);
+	}
+
+	// ---------------------------------------------------------------- ambient colour
+	// a 1-in-8 sample of the video frame every few seconds: a soft two-colour background
+	let ambientTimer = 0, bgFlip = false;
+	const cvs = document.createElement('canvas');
+	cvs.width = 8;
+	cvs.height = 6;
+	function ambient() {
+		clearTimeout(ambientTimer);
+		ambientTimer = setTimeout(ambient, 6000);
+		if (!root || !visible || !video || video.paused || video.readyState < 2 || document.hidden) return;
+		try {
+			const g = cvs.getContext('2d', { willReadFrequently: true });
+			g.drawImage(video, 0, 0, 8, 6);
+			const d = g.getImageData(0, 0, 8, 6).data;
+			const avg = (x0, x1) => {
+				let r = 0, gg = 0, b = 0, n = 0;
+				for (let y = 0; y < 6; ++y) for (let x = x0; x < x1; ++x) {
+					const p = (y * 8 + x) * 4;
+					r += d[p]; gg += d[p + 1]; b += d[p + 2]; n++;
+				}
+				return [r / n, gg / n, b / n];
+			};
+			const tone = ([r, g2, b], k) => {
+				// keep it dark and a little saturated, so white text always reads well
+				const m = Math.max(r, g2, b) || 1;
+				const s = 0.55;
+				const f = (v) => Math.round((v * s + m * (1 - s)) * k);
+				return `rgb(${f(r)},${f(g2)},${f(b)})`;
+			};
+			const L = avg(0, 4), R = avg(4, 8);
+			const scale = (c) => Math.min(1, 95 / (Math.max(...c) || 1));
+			const css = `radial-gradient(120% 90% at 0% 0%, ${tone(L, scale(L))} 0%, transparent 70%), radial-gradient(120% 100% at 100% 100%, ${tone(R, scale(R) * 0.9)} 0%, transparent 75%), #15151b`;
+			const a = $('.bg.a'), b = $('.bg.b');
+			bgFlip = !bgFlip;
+			(bgFlip ? b : a).style.background = css;
+			b.style.opacity = bgFlip ? '1' : '0';
+		} catch (e) {
+			/* cross-origin frame: keep the default */
+		}
+	}
+
+	// ---------------------------------------------------------------- video binding
+	const VIDEO_EVENTS = ['play', 'playing', 'pause', 'seeking', 'seeked', 'ratechange', 'timeupdate', 'waiting'];
+
+	// ------------------------------------------------------------ clock: wall time -> video time
+	// The analysis reports wall-clock times; the video's clock is sampled on its events (several
+	// per second while playing) and extrapolated in between.
+	const clock = []; // {w, m, playing, rate}
+	function noteClock() {
+		if (!video) return;
+		clock.push({ w: Date.now(), m: video.currentTime, playing: !video.paused && !video.seeking && video.readyState > 2, rate: video.playbackRate || 1 });
+		if (clock.length > 900) clock.splice(0, 300);
+	}
+	function mediaAt(w) {
+		for (let i = clock.length - 1; i >= 0; --i) {
+			const c = clock[i];
+			if (c.w <= w) {
+				if (!c.playing) return null;
+				const m = c.m + ((w - c.w) / 1000) * c.rate;
+				// a later entry (seek, pause) before w + 50 ms would contradict this
+				return m;
+			}
+		}
+		return null;
+	}
+	let lastTU = 0;
+	function onVideoEvent(e) {
+		noteClock();
+		if (!root) return;
+		$('.card').classList.toggle('paused', video.paused);
+		if (e.type === 'timeupdate') {
+			// cheap safety net (4 times a second): only acts if the shown line is wrong
+			const now = performance.now();
+			if (now - lastTU < 900 && timer) return;
+			lastTU = now;
+			const t = lyricsNow();
+			const it = S.items && S.items[S.idx];
+			const nx = S.items && S.items[S.idx + 1];
+			if ((it && t < it.t - 0.05) || (nx && t >= nx.t + 0.05) || !timer) place();
+			return;
+		}
+		if (e.type === 'seeked' && S.manual) setManual(false);
+		place(e.type === 'seeked');
+		if (e.type === 'play' || e.type === 'playing') ambient();
+	}
+	// (playing, not seeking, and yet waiting for frames)
+	function onWaiting() {
+		if (video && !video.paused && !video.seeking) Q.waits.push(performance.now());
+	}
+	function bindVideo(to) {
+		const v = to === null ? null : mainVideo();
+		if (v === video) return;
+		if (video) { for (const ev of VIDEO_EVENTS) video.removeEventListener(ev, onVideoEvent); video.removeEventListener('waiting', onWaiting); }
+		video = v;
+		if (video) { for (const ev of VIDEO_EVENTS) video.addEventListener(ev, onVideoEvent); video.addEventListener('waiting', onWaiting); }
+	}
+
+	// ---------------------------------------------------------------- audio analysis
+	// singing activity (0.1 s bins) and recognised words arrive with wall-clock times
+	// singing activity by 0.1 s media bin (for checking recognised text), last ~10 minutes
+	const voiced = new Map();
+	function voicedShare(a, b) {
+		let n = 0, v = 0;
+		for (let k = Math.round(a / 0.1); k < Math.round(b / 0.1); ++k) {
+			const x = voiced.get(k);
+			if (x === undefined) continue;
+			n++;
+			v += x >= 0.5 ? 1 : 0;
+		}
+		return n >= 5 ? v / n : null;
+	}
+
+	function onSignal(m) {
+		if (!video || !S.capturing) return;
+		if (m.vad) {
+			const { wall0, binSec, bins } = m.vad;
+			for (let i = 0; i < bins.length; ++i) {
+				const mt = mediaAt(wall0 + i * binSec * 1000);
+				if (mt != null) voiced.set(Math.round(mt / 0.1), bins[i]);
+			}
+			if (voiced.size > 6000) for (const k of [...voiced.keys()].slice(0, 1000)) voiced.delete(k);
+		}
+		if (m.vad && S.follower) {
+			const { wall0, binSec, bins } = m.vad;
+			let run = null;
+			const flush = () => {
+				if (run && run.v.length) S.follower.add(run.k0 * 0.1, run.v);
+				run = null;
+			};
+			for (let i = 0; i < bins.length; ++i) {
+				const mt = mediaAt(wall0 + i * binSec * 1000);
+				if (mt == null) { flush(); continue; }
+				const k = Math.round(mt / 0.1);
+				if (run && k === run.k0 + run.v.length) run.v.push(bins[i]);
+				else if (run && Math.abs(k - (run.k0 + run.v.length)) <= 1) run.v.push(bins[i]); // jitter
+				else { flush(); run = { k0: k, v: [bins[i]] }; }
+				S.horizon = Math.max(S.horizon, mt + binSec);
+			}
+			flush();
+			maybeSolve();
+			place();
+		}
+		if (m.asr) onWords(m.asr);
+	}
+
+	function maybeSolve(force = false) {
+		const now = performance.now();
+		if (!S.follower || (!force && now - S.lastSolveAt < 3000)) return;
+		S.lastSolveAt = now;
+		const fo = S.follower, gen = S.gen;
+		// in small slices between the page's own work (never a stutter in the video)
+		fo.solveAsync().then((changed) => {
+			if (fo !== S.follower || gen !== S.gen) return;
+			solved(changed);
+		});
+	}
+
+	function solved(changed) {
+		const before = S.map.toLyrics(heardMedia());
+		if (changed && S.mapSource !== 'user') {
+			S.map = S.follower.map;
+			S.mapSource = 'auto';
+			const shift = Math.abs(S.map.toLyrics(heardMedia()) - before);
+			if (shift > 1.2 && !S.announced) {
+				S.announced = true;
+				toast(msg('lyricsAutoSynced'));
+			}
+			saveTiming();
+			// heard-only lines are placed by the map: re-place them
+			if (S.live.length) {
+				const keepIdx = S.idx;
+				render();
+				S.idx = keepIdx;
+			}
+			place(true);
+			updateNeed();
+		}
+	}
+
+	// recognised words: anchors for the alignment, parts sung differently, or (no lyrics) the
+	// lyrics themselves
+	function onWords(asr) {
+		const segs = [];
+		for (const s of asr.segs) {
+			const a = mediaAt(s.wa), b = mediaAt(s.wb);
+			if (a == null || b == null || b <= a) continue;
+			if (KCL.isHallucination(s.text)) continue;
+			// text where the vocals were silent is made up (Whisper does that over music)
+			const share = voicedShare(a, b);
+			if (share !== null && share < 0.2) continue;
+			segs.push({ m: a, d: b - a, text: s.text, logprob: s.logprob });
+		}
+		if (!segs.length) return;
+		if (S.status === 'notfound' || S.status === 'live') {
+			// live transcription: what a new window heard replaces what was there before
+			const wa = mediaAt(asr.window.wa) ?? segs[0].m;
+			const wb = mediaAt(asr.window.wb) ?? segs[segs.length - 1].m + segs[segs.length - 1].d;
+			S.live = S.live.filter((h) => h.m + h.d * 0.5 < wa + 0.5 || h.m >= wb);
+			for (const x of segs) S.live.push(...splitLine(x));
+			S.live.sort((x, y) => x.m - y.m);
+			S.live = S.live.slice(-400);
+			saveLive();
+			S.status = 'live';
+			S.synced = true;
+			S.lines = [];
+			S.map = new KCL.TimeMap();
+			setHeader();
+			setStatus(null);
+			const keep = S.scrollY;
+			render();
+			S.scrollY = keep;
+			place(true);
+			return;
+		}
+		if (S.status === 'ready' && S.plain) {
+			// lyrics without times: every recognised phrase places lines
+			S.plainSegs = (S.plainSegs || 0) + segs.length;
+			S.plain.add(segs);
+			const T = S.plain.lines2();
+			if (T) {
+				const was = S.synced;
+				S.lines = T;
+				S.synced = true;
+				S.map = new KCL.TimeMap();
+				const keep = S.scrollY;
+				setHeader();
+				render();
+				S.scrollY = keep;
+				place(true);
+				if (!was) toast(msg('lyricsPlainSynced'));
+				savePref({ plainTimed: T.map((l) => ({ t: +l.t.toFixed(2), text: l.text })), plainKey: S.plainKey });
+			}
+			return;
+		}
+		if (S.status !== 'ready' || !S.follower) return;
+		(S.heardSegs = S.heardSegs || []).push(...segs);
+		if (S.heardSegs.length > 300) S.heardSegs.splice(0, S.heardSegs.length - 300);
+		checkAlts(segs);
+		// changed parts can only be told once the timing is known (aligned, or the very recording)
+		const timingKnown = S.mapSource === 'auto' || S.mapSource === 'user' || (S.follower && S.follower.opts.sameLength);
+		const { anchors, heard, log } = KCL.matchSegments(segs, S.lines, timingKnown ? { toLyrics: (m) => S.map.toLyrics(m) } : {});
+		(S.asrLog = (S.asrLog || []).concat(log)).splice(0, Math.max(0, S.asrLog.length - 40));
+		for (const an of anchors) S.follower.addAnchor(an.m, an.l, an.w, an);
+		if (heard.length && S.heardOn) {
+			// lines sung differently from the lyrics: shown in place (marked) — a helper, only
+			// when asked for (the lyrics written in the description / comments come first)
+			for (const h of heard) {
+				if (!S.live.some((x) => Math.abs(x.m - h.m) < 1.5)) S.live.push(h);
+			}
+			S.live.sort((x, y) => x.m - y.m);
+			const keepIdx = S.idx;
+			render();
+			S.idx = keepIdx;
+		}
+		if (anchors.length) maybeSolve(true);
+		place(true);
+	}
+
+	const splitLine = (x) => KCL.splitSegment(x);
+
+	// live transcriptions are kept per video: the next play shows them in time from the start
+	let liveSaveTimer = 0;
+	function saveLive() {
+		clearTimeout(liveSaveTimer);
+		liveSaveTimer = setTimeout(() => savePref({ live: S.live.slice(-300).map((h) => ({ m: +h.m.toFixed(2), d: +h.d.toFixed(2), text: h.text })) }), 2000);
+	}
+
+	// ---------------------------------------------------------------- keeping the video smooth
+	// Dropped frames / the video waiting while it should play = the computer is short of time.
+	// The speech recognition (the heaviest optional part) is then paused for a while; the
+	// lyrics keep following the singing activity, which costs next to nothing.
+	const Q = { dropped: 0, total: 0, waits: [], checkedAt: 0 };
+	function watchLoad() {
+		if (!video || video.paused || video.seeking || !isWatch()) { Q.dropped = Q.total = 0; return; }
+		const q = video.getVideoPlaybackQuality && video.getVideoPlaybackQuality();
+		if (!q) return;
+		const dd = q.droppedVideoFrames - Q.dropped, dt = q.totalVideoFrames - Q.total;
+		Q.dropped = q.droppedVideoFrames;
+		Q.total = q.totalVideoFrames;
+		const now = performance.now();
+		Q.waits = Q.waits.filter((t) => now - t < 12000);
+		if (dt > 30 && dd / dt > 0.06 || Q.waits.length >= 2) {
+			const fresh = now >= S.shedUntil;
+			(S.shedLog = S.shedLog || []).push([+(video.currentTime || 0).toFixed(1), dt > 30 && dd / dt > 0.06 ? 'dropped' : 'waits']);
+			if (S.shedLog.length > 50) S.shedLog.shift();
+			S.shedUntil = now + 120000;
+			Q.waits = [];
+			if (fresh) updateNeed(true);
+		}
+	}
+	every(() => { if (alive()) watchLoad(); }, 3000);
+	// one more sign the computer is short of time: the delayed picture of the key changer misses
+	// frames (it says so on the page; the video's own counter does not see it - the video is
+	// hidden under it). (The page's own long tasks are not one: YouTube has plenty of them on
+	// any computer, and taking them as one kept the speech recognition from ever running.)
+	on(window, 'kc-overlay-jank', () => { if (video && !video.paused) Q.waits.push(performance.now()); });
+
+	// tell the offscreen analysis what this panel needs
+	let needSent = '';
+	let needTimer = 0;
+	function updateNeed(force = false) {
+		clearTimeout(needTimer);
+		needTimer = setTimeout(() => updateNeed(true), 10000);
+		if (!S.enabled || !isWatch()) return;
+		let need = { mode: 'off' };
+		// the video is dropping frames / stalling: the listening is the first thing to give up
+		if (S.ai === false || performance.now() < S.shedUntil) need = { mode: 'off' };
+		else if (S.status === 'notfound' || S.status === 'live') need = { mode: 'live', intensity: 'high', lang: null };
+		else if (S.status === 'ready' && S.plain) {
+			const lines = S.lines.filter((l) => l.text);
+			const at = Math.max(0, S.idx);
+			need = { mode: 'align', intensity: 'continuous', prompt: lines.slice(at, at + 8).map((l) => l.text).join(' ').slice(0, 220), lang: KCL.hasJapanese(lines.map((l) => l.text).join('')) ? 'ja' : null };
+		}
+		// (timed lyrics written for this very video need no listening at all)
+		else if (S.status === 'ready' && S.synced && S.mapSource !== 'user' && !(S.rec && S.rec.forThisVideo && !S.estimated) && !(S.follower && S.follower.opts.sameLength && !(S.meta && S.meta.isCover))) {
+			// (a video as long as the recording the lyrics were timed on is that recording: the
+			// lyrics fit as they are, no recogniser needed; the singing activity of hq mode still
+			// checks them for free)
+			const sure0 = S.follower && S.follower.solved && S.follower.solved.margin > 8;
+			// phrases heard that agree with where the lyrics are put: the position is known (a
+			// cover too), so the recogniser only checks now and then
+			const lockedOn = S.follower && S.follower.anchorsExt && S.follower.anchorsExt.slice(-10).filter((an) => an.w >= 0.5 && Math.abs(an.l - S.map.toLyrics(an.m)) < 0.8).length >= 3;
+			const sure = sure0 && (!(S.meta && S.meta.isCover) || lockedOn);
+			// The recogniser is told which words to expect. Only once heard phrases confirm the
+			// position, the lines around it; before that, lines from all over the song (words
+			// expected at a wrong place would be "heard" there and confirm the wrong place)
+			const confirmed = S.follower && S.follower.anchorsExt && S.follower.anchorsExt.slice(-8).filter((an) => an.w >= 0.5 && Math.abs(an.l - S.map.toLyrics(an.m)) < 0.8).length >= 2;
+			const texts = S.lines.map((l) => l.text).filter(Boolean);
+			const spread = [...new Set(texts)].filter((x, i, arr) => i % Math.max(1, Math.round(arr.length / 10)) === 0);
+			const around = (confirmed ? S.lines.slice(Math.max(0, S.idx - 2), Math.max(0, S.idx) + 8).map((l) => l.text).filter(Boolean) : spread).join(' ').slice(0, 220);
+			const otherVersion = S.meta && (S.meta.isCover || /live|ライブ|arrange|アレンジ|remix|ver\.|version|弾き語り|acoustic/i.test(S.meta.title || ''));
+			need = { mode: 'align', intensity: !sure ? 'high' : otherVersion ? 'medium' : 'low', prompt: around, lang: S.lang };
+		}
+		const key = JSON.stringify([need.mode, need.intensity, need.lang]);
+		if (!force && key === needSent) return;
+		needSent = key;
+		send({ type: 'lyrics-need', need }).then((r) => {
+			if (r && typeof r.capturing === 'boolean' && r.capturing !== S.capturing) {
+				S.capturing = r.capturing;
+				if (root) setHeader();
+				place(true);
+			}
+		});
+	}
+
+	// ---------------------------------------------------------------- navigation
+	let lastHref = '';
+	function onNavigate() {
+		if (!alive()) return retire();
+		if (location.href === lastHref) return;
+		lastHref = location.href;
+		if (!S.enabled || !isWatch()) {
+			S.gen++;
+			clearTimeout(timer);
+			if (dockPage() && S.enabled) {
+				S.status = 'idle'; // (the key control stays; the lyrics start again on a video page)
+				S.videoId = null;
+				mount();
+			} else unmount();
+			return;
+		}
+		bindVideo();
+		if (currentId() !== S.videoId || S.status === 'idle') load();
+		else mount();
+	}
+
+	function tick() {
+		// cheap housekeeping once every 2 s: page rebuilt our column, video element replaced,
+		// navigation events missed
+		if (!alive()) return retire();
+		// (a panel of the version before an update, put back by its script on navigation - also
+		// when the lyrics are turned off here)
+		for (const h of document.querySelectorAll('#kc-lyrics')) if (h !== host) { if (!h.hasAttribute('data-kc-v')) S.stalePage = true; h.remove(); }
+		// scripts of a version before 1.4.1 still in this page (they cannot be stopped): ask for a reload
+		if (root && (S.stalePage || document.documentElement.hasAttribute('data-kc-stale'))) $('.stale').hidden = false;
+		onNavigate();
+		if (S.enabled && dockPage() && !isWatch()) {
+			mount();
+			if (root && performance.now() - K.at > 4000) refreshKey();
+		}
+		if (S.enabled && isWatch()) {
+			mount();
+			if (root && performance.now() - K.at > 4000) refreshKey();
+			bindVideo();
+			if (S.status === 'notfound' || S.status === 'error') {
+				// metadata may not have been ready (duration 0): retry once it is
+				const m = readMeta();
+				if (S.meta && !S.meta.duration && m.duration && S.retried !== S.videoId) {
+					S.retried = S.videoId;
+					load();
+				}
+			}
+		}
+	}
+	every(tick, 2000);
+	// (cut off from the extension: noticed within a second)
+	every(() => { if (!alive()) retire(); }, 1000);
+	on(document, 'yt-navigate-finish', () => setTimeout(onNavigate, 50));
+	on(window, 'popstate', () => setTimeout(onNavigate, 50));
+
+	// ---------------------------------------------------------------- messages
+	chrome.runtime.onMessage.addListener((m) => {
+		if (!m) return;
+		if (m.type === 'audio-delay') {
+			const before = S.audioDelay;
+			S.audioDelay = Math.max(0, Math.min(4, Number(m.seconds) || 0));
+			if (Math.abs(before - S.audioDelay) > 0.01) place(true);
+		} else if (m.type === 'lyrics-align' && m.videoId === S.videoId && S.status === 'ready') {
+			// alignment from the audio analysis: anchors (media -> lyrics) and lines heard but
+			// not in the lyrics. A correction made by the user wins.
+			if (S.mapSource !== 'user' && m.anchors && m.anchors.length) {
+				const before = S.map.toLyrics(heardMedia());
+				S.map.set(m.anchors);
+				S.mapSource = 'auto';
+				if (Math.abs(S.map.toLyrics(heardMedia()) - before) > 0.6 && m.announce) toast(msg('lyricsAutoSynced'));
+				saveTiming();
+			}
+			if (m.heard) {
+				S.live = m.heard;
+				const keepY = S.scrollY;
+				render();
+				S.scrollY = keepY;
+			}
+			place(true);
+		} else if (m.type === 'lyrics-live' && m.videoId === S.videoId && (S.status === 'notfound' || S.status === 'live')) {
+			// no lyrics anywhere: show what speech recognition hears, as it comes
+			S.status = 'live';
+			S.synced = true;
+			S.lines = [];
+			S.live = m.lines;
+			S.map = new KCL.TimeMap();
+			setHeader();
+			setStatus(null);
+			render();
+			place(true);
+		} else if (m.type === 'lyrics-listening') {
+			S.listening = !!m.on;
+			if (S.status === 'notfound') setStatus('notfound');
+		} else if (m.type === 'lyrics-capture') {
+			S.capturing = !!m.on;
+			if (!S.capturing) S.horizon = -1;
+			if (root) setHeader();
+			updateNeed(true);
+			place(true);
+		} else if (m.type === 'lyrics-signal') {
+			onSignal(m);
+		}
+	});
+
+	chrome.storage.onChanged.addListener((ch, area) => {
+		if (area !== 'local' || !ch.settings) return;
+		const on = ch.settings.newValue && ch.settings.newValue.lyrics !== false;
+		if (ch.settings.newValue && typeof ch.settings.newValue.semitones === 'number' && !K.pending && root && ch.settings.newValue.semitones !== K.value) {
+			K.value = ch.settings.newValue.semitones;
+			paintKey(true);
+		}
+		const ai = !ch.settings.newValue || ch.settings.newValue.lyricsAi !== false;
+		S.heardOn = !!(ch.settings.newValue && ch.settings.newValue.lyricsHeard);
+		if (ai !== S.ai) {
+			S.ai = ai;
+			updateNeed(true);
+		}
+		if (on === S.enabled) return;
+		S.enabled = on;
+		lastHref = '';
+		S.status = 'idle';
+		onNavigate();
+	});
+
+	(async () => {
+		try {
+			const { settings } = await chrome.storage.local.get('settings');
+			S.enabled = !settings || settings.lyrics !== false;
+			S.ai = !settings || settings.lyricsAi !== false;
+			S.heardOn = !!(settings && settings.lyricsHeard);
+		} catch (e) { /* defaults */ }
+		const { delay } = (await send({ type: 'audio-delay-get' })) || {};
+		S.audioDelay = Number(delay) || 0;
+		onNavigate();
+	})();
+
+	// debugging / tests: the page can ask for a snapshot (content scripts live in their own world)
+	on(window, 'kc-lyrics-debug', () => {
+		if (!host) return;
+		host.setAttribute('data-debug', JSON.stringify({
+			status: S.status, idx: S.idx, synced: S.synced, audioDelay: S.audioDelay, mapSource: S.mapSource, map: S.map.toJSON(),
+			items: (S.items || []).map((l) => ({ t: l.t, end: l.end, dots: !!l.dots, live: !!l.live, text: l.text })),
+			lyricsNow: video ? lyricsNow() : null, rec: S.rec && { id: S.rec.id, trackName: S.rec.trackName, artistName: S.rec.artistName },
+			capturing: S.capturing, horizon: S.horizon, asrLog: S.asrLog || [],
+			alts: (S.alts || []).map((a) => ({ id: a.rec.id, score: +a.score.toFixed(2), n: a.n })), heardSegs: (S.heardSegs || []).length,
+			plain: S.plain && { matches: S.plain.matches.length, chain: S.plain.chain().length, segs: S.plainSegs || 0 },
+			fol: S.follower && { voiced: +S.follower.al.voicedSeconds.toFixed(1), anchors: S.follower.al.anchorsExt.length, margin: S.follower.solved && +S.follower.solved.margin.toFixed(1), offset: S.follower.solved && S.follower.solved.offset, tempo: S.follower.solved && S.follower.solved.tempo },
+		}));
+	});
+	// tests: what the tracker was given (to replay it offline)
+	on(window, 'kc-lyrics-dump', () => {
+		if (!host || !S.follower) return;
+		host.setAttribute('data-dump', JSON.stringify({ segs: S.follower.segs, anchors: S.follower.anchorsExt, lines: S.follower.lines, opts: S.follower.opts, asrLog: S.asrLog || [] }));
+	});
+})();
