@@ -1,0 +1,562 @@
+// Service worker: starts/stops tab capture and relays settings to the offscreen document,
+// where all audio processing happens. Also keeps track of which song is playing, so the key
+// can be remembered per song (キー帳), and handles the keyboard shortcuts.
+import { loadSettings, saveSettings, songIdFromUrl, cleanTitle, loadSongs, saveSong } from './lib/settings.js';
+import './lib/lyrics/text.js';
+import './lib/lyrics/lrc.js';
+import './lib/lyrics/sources.js';
+import './lib/lyrics/query.js';
+import './lib/lyrics/ytdata.js';
+import * as updater from './lib/updater.js';
+
+const KCL = globalThis.KCL;
+
+const OFFSCREEN_URL = 'offscreen/offscreen.html';
+
+async function hasOffscreen() {
+	const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+	return contexts.length > 0;
+}
+
+async function ensureOffscreen() {
+	if (await hasOffscreen()) return;
+	await chrome.offscreen.createDocument({
+		url: OFFSCREEN_URL,
+		reasons: ['USER_MEDIA'],
+		justification: chrome.i18n.getMessage('offscreenWhy'),
+	});
+}
+
+async function getState() {
+	const { state } = await chrome.storage.session.get('state');
+	return state || { active: false, tabId: null };
+}
+
+async function setState(state) {
+	await chrome.storage.session.set({ state });
+	updateBadge(state);
+}
+
+const ICONS = (kind) => Object.fromEntries([16, 32, 48, 128].map((n) => [n, `icons/${kind}${n}.png`]));
+
+async function updateBadge(state) {
+	// coloured icon while active, grey otherwise
+	await chrome.action.setIcon({ path: ICONS(state.active ? 'icon' : 'gray') }).catch(() => {});
+	const settings = await loadSettings();
+	const text = state.active ? (settings.semitones > 0 ? '+' : '') + settings.semitones : '';
+	await chrome.action.setBadgeBackgroundColor({ color: '#5b5bd6' });
+	await chrome.action.setBadgeText({ text });
+}
+
+// The song playing in a tab (id derived from the URL) and the key saved for it, if any.
+async function songOf(tabId) {
+	try {
+		const tab = await chrome.tabs.get(tabId);
+		const id = songIdFromUrl(tab.url || '');
+		return { id, title: cleanTitle(tab.title), url: tab.url || '' };
+	} catch (e) {
+		return { id: null, title: '', url: '' };
+	}
+}
+
+// When a remembered song starts, switch to its key.
+async function restoreKey(settings, song) {
+	if (!settings.autoKey || !song.id) return settings;
+	const saved = (await loadSongs())[song.id];
+	if (saved && typeof saved.key === 'number' && saved.key !== settings.semitones) {
+		settings = { ...settings, semitones: saved.key };
+		await saveSettings(settings);
+	}
+	return settings;
+}
+
+// Must run after the user opened the extension (popup / shortcut) on that tab.
+async function start(tabId) {
+	const state = await getState();
+	if (state.active) await stop();
+	// the offscreen document must exist before the stream id is requested
+	await ensureOffscreen();
+	const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
+	const song = await songOf(tabId);
+	const settings = await restoreKey(await loadSettings(), song);
+	// speed of the separation model measured on this computer before (skips re-measuring)
+	const { sepProfile } = await chrome.storage.local.get('sepProfile');
+	const profile = sepProfile && sepProfile.version === chrome.runtime.getManifest().version ? sepProfile : null;
+	const res = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'start', streamId, settings, profile });
+	if (!res || !res.ok) throw new Error(res && res.error || 'could not start audio processing');
+	await setState({ active: true, tabId, song });
+	try {
+		const tab = await chrome.tabs.get(tabId);
+		if (tab.mutedInfo && tab.mutedInfo.muted) await chrome.runtime.sendMessage({ target: 'offscreen', type: 'mute', muted: true });
+	} catch (e) { /* tab gone */ }
+	videoSyncApplied = settings.videoSync;
+	if (settings.videoSync) await injectVideoSync(tabId);
+	// the lyrics panel of this tab can now use the audio analysis; the delay may have been
+	// reported before capture counted as active
+	const { latency = 0 } = await chrome.storage.session.get('latency');
+	await sendToTab(tabId, { type: 'audio-delay', seconds: latency });
+	await sendToTab(tabId, { type: 'lyrics-capture', on: true });
+	return res;
+}
+
+async function stop() {
+	const state = await getState();
+	if (await hasOffscreen()) {
+		await chrome.runtime.sendMessage({ target: 'offscreen', type: 'stop' }).catch(() => {});
+		await chrome.offscreen.closeDocument().catch(() => {});
+	}
+	if (state.tabId != null) {
+		await sendVideoDelay(state.tabId, 0);
+		await sendToTab(state.tabId, { type: 'audio-delay', seconds: 0 });
+		await sendToTab(state.tabId, { type: 'lyrics-capture', on: false });
+	}
+	await chrome.storage.session.set({ latency: 0 });
+	await setState({ active: false, tabId: null });
+	// an update that waited for the processing to end
+	setTimeout(() => runUpdateCheck({ onlyIfPending: true }), 4000);
+}
+
+// ---------------------------------------------------------------- updates
+// Looked for a few minutes after the browser starts and every few hours. Taken at once only
+// when nothing is being processed (a reload ends the capture) and the extension's folder is
+// known and writable; otherwise it waits (shown in the popup) until it is.
+let updateRunning = null;
+function runUpdateCheck({ manual = false, onlyIfPending = false } = {}) {
+	if (updateRunning) return updateRunning;
+	updateRunning = (async () => {
+		try {
+			if (onlyIfPending && !(await chrome.storage.local.get('updateAvailable')).updateAvailable) return null;
+			const settings = await loadSettings();
+			const state = await getState();
+			// (processing may have been started while the update downloaded: stopped the normal way
+			// before the reload)
+			const reload = async () => {
+				if ((await getState()).active) await stop();
+				chrome.runtime.reload();
+			};
+			return await updater.check({ auto: settings.autoUpdate !== false, busy: !!state.active, reload });
+		} finally {
+			updateRunning = null;
+		}
+	})();
+	return updateRunning;
+}
+// (created once: creating it again on every start of the service worker - which sleeps after
+// half a minute - would put the first check a few minutes after every wake-up)
+chrome.alarms.get('kc-update').then((a) => {
+	if (!a || a.periodInMinutes !== updater.CHECK_EVERY_MIN) chrome.alarms.create('kc-update', { delayInMinutes: 3, periodInMinutes: updater.CHECK_EVERY_MIN });
+});
+chrome.alarms.onAlarm.addListener((a) => {
+	if (a.name === 'kc-update') runUpdateCheck();
+});
+
+// Settings changes are applied strictly one after another (in arrival order), and a change that
+// has already been replaced by a newer one is skipped. Otherwise fast key changes could finish
+// out of order and leave the sound on an older key than the one shown.
+let applyQueue = Promise.resolve();
+let latestSettings = null;
+let videoSyncApplied = null;
+
+function applySettings(settings) {
+	latestSettings = settings;
+	const run = applyQueue.then(() => (latestSettings === settings ? applySettingsNow(settings) : { ok: true, superseded: true }));
+	applyQueue = run.catch(() => {});
+	return run;
+}
+
+async function applySettingsNow(settings) {
+	const state = await getState();
+	if (!state.active) {
+		await updateBadge(state);
+		return { ok: true };
+	}
+	// the sound first, bookkeeping after
+	const res = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'settings', settings });
+	await updateBadge(state);
+	// remember the key for this song (キー帳)
+	if (settings.autoKey && state.song && state.song.id) {
+		const saved = (await loadSongs())[state.song.id];
+		if (!saved || saved.key !== settings.semitones) {
+			await saveSong(state.song.id, { key: settings.semitones, title: state.song.title, url: state.song.url });
+		}
+	}
+	if (settings.videoSync !== videoSyncApplied) {
+		videoSyncApplied = settings.videoSync;
+		if (settings.videoSync) await injectVideoSync(state.tabId);
+		else await sendVideoDelay(state.tabId, 0);
+	}
+	return res;
+}
+
+async function injectVideoSync(tabId) {
+	try {
+		await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['content/video-delay.js'] });
+	} catch (e) {
+		// pages such as chrome:// cannot be scripted; audio still works
+		return;
+	}
+	const { latency = 0 } = await chrome.storage.session.get('latency');
+	await sendVideoDelay(tabId, latency);
+}
+
+async function sendToTab(tabId, m) {
+	try {
+		await chrome.tabs.sendMessage(tabId, m);
+	} catch (e) {
+		// no content script in that tab
+	}
+}
+
+// ---------------------------------------------------------------- lyrics (LRCLIB)
+const LRCLIB = 'https://lrclib.net/api/';
+const lrclibCache = new Map(); // url -> json (this session)
+// A service that hangs or keeps failing is left alone for a while (the next search asks it
+// again): a hanging LRCLIB must not hold the other databases back for most of a minute.
+const downUntil = new Map(); // host -> time
+async function lrclib(url, retry = 1) {
+	if (lrclibCache.has(url)) return lrclibCache.get(url);
+	const host = new URL(url).host;
+	if ((downUntil.get(host) || 0) > Date.now()) throw new Error('service resting');
+	try {
+		const j = await lrclibOnce(url);
+		downUntil.delete(host);
+		return j;
+	} catch (e) {
+		// a busy server (5xx / 429) or a dropped connection: asked once more (one of the two
+		// readings of a title must not go missing because of it); no answer at all: not again
+		const hung = e && e.name === 'AbortError';
+		if (hung || retry <= 0) {
+			downUntil.set(host, Date.now() + (hung ? 60000 : 30000));
+			throw e;
+		}
+		await new Promise((r) => setTimeout(r, 700));
+		return lrclib(url, retry - 1);
+	}
+}
+async function lrclibOnce(url) {
+	const ctl = new AbortController();
+	const to = setTimeout(() => ctl.abort(), 6000);
+	try {
+		const r = await fetch(url, { signal: ctl.signal, headers: { 'Lrclib-Client': `NaturalKeyChanger/${chrome.runtime.getManifest().version}` } });
+		const j = r.status === 404 ? null : r.ok ? await r.json() : Promise.reject(new Error('HTTP ' + r.status));
+		lrclibCache.set(url, j);
+		if (lrclibCache.size > 400) lrclibCache.delete(lrclibCache.keys().next().value);
+		return j;
+	} finally {
+		clearTimeout(to);
+	}
+}
+
+// the lyrics found for each video, so a video opens instantly the next time
+const LYRICS_CACHE = 'lyricsCache';
+// bumped when the search improves: results found by an older one are searched again
+const SEARCH_VERSION = 4; // 4: NetEase / QQ Music as well
+async function cachedLyrics(videoId) {
+	const o = await chrome.storage.local.get(LYRICS_CACHE);
+	return (o[LYRICS_CACHE] || {})[videoId] || null;
+}
+async function cacheLyrics(videoId, entry) {
+	if (!videoId) return;
+	const o = await chrome.storage.local.get(LYRICS_CACHE);
+	const all = o[LYRICS_CACHE] || {};
+	all[videoId] = { ...entry, at: Date.now() };
+	const keys = Object.keys(all);
+	if (keys.length > 80) keys.sort((a, b) => all[a].at - all[b].at).slice(0, keys.length - 80).forEach((k) => delete all[k]);
+	await chrome.storage.local.set({ [LYRICS_CACHE]: all });
+}
+const slim = (r) => r && { id: r.id, db: r.db || 'lrclib', trackName: r.trackName, artistName: r.artistName, albumName: r.albumName, duration: r.duration, syncedLyrics: r.syncedLyrics || null, plainLyrics: r.plainLyrics || null, lazy: !!r.lazy, match: r.match };
+// one record by id, from whichever database it came from
+async function getRecord(id) {
+	if (KCL.sources.isSourceId(id)) return KCL.sources.get(id, lrclib);
+	return lrclib(LRCLIB + 'get/' + Number(id));
+}
+
+async function findLyrics({ meta, prefer, force }) {
+	const id = meta.videoId;
+	// (an id of lyrics written on the page - yt-description:… - is not one of a database)
+	if (prefer && !/^\d+$/.test(String(prefer)) && !KCL.sources.isSourceId(prefer)) prefer = null;
+	if (!force) {
+		const c = await cachedLyrics(id);
+		// (only a result found by this search, for this very title: never one found while the
+		// page still showed the previous video)
+		// (a video without lyrics is searched again after a day: they may have been added)
+		const fresh = c && (c.v === SEARCH_VERSION || (prefer && c.best && c.best.id === prefer)) && (!c.title || !meta.title || c.title === meta.title) && (c.best || Date.now() - (c.at || 0) < 864e5);
+		if (fresh && (!prefer || (c.best && c.best.id === prefer))) return { ok: true, ...c, cached: true };
+	}
+	if (prefer) {
+		try {
+			const rec = await getRecord(prefer);
+			if (rec && rec.id) {
+				const res = { best: slim(rec), candidates: [] };
+				await cacheLyrics(id, res);
+				return { ok: true, ...res };
+			}
+		} catch (e) { /* fall back to a search */ }
+	}
+	const r = await KCL.query.find(meta, lrclib, { base: LRCLIB });
+	const res = { best: slim(r.best), candidates: r.candidates.map(slim), parsed: { isCover: r.parsed.isCover }, v: SEARCH_VERSION, title: meta.title || '' };
+	// (nothing found while a database did not answer: not kept - the next visit asks again)
+	if (r.best || (r.candidates.length && !r.incomplete)) await cacheLyrics(id, res);
+	return { ok: true, ...res };
+}
+
+async function searchLyrics({ title, artist, duration }) {
+	const reqs = [];
+	if (title && artist) reqs.push({ track_name: title, artist_name: artist });
+	if (title) reqs.push({ track_name: title });
+	reqs.push({ q: [title, artist].filter(Boolean).join(' ') });
+	const pool = new Map();
+	for (const q of reqs) {
+		try {
+			const res = await lrclib(LRCLIB + 'search?' + new URLSearchParams(q));
+			for (const rec of res || []) if (!pool.has(rec.id)) pool.set(rec.id, rec);
+		} catch (e) { /* next */ }
+	}
+	const parsed = KCL.query.parseVideo({ title: [artist, title].filter(Boolean).join(' - '), channel: '' });
+	for (const [id, r] of pool) pool.set(id, { ...r, match: KCL.query.score(r, parsed, duration) });
+	// the other databases too (their lyrics are fetched for the best few)
+	try { await KCL.sources.extend(pool, parsed, lrclib, (r, assume) => KCL.query.score(r, parsed, duration, assume), { extra: [[title, artist].filter(Boolean).join(' ')], fetchTop: 6 }); } catch (e) { /* LRCLIB's results stand */ }
+	const ranked = [...pool.values()].sort((a, b) => (a.lazy ? 1 : 0) - (b.lazy ? 1 : 0) || b.match.score - a.match.score);
+	return { ok: true, candidates: ranked.slice(0, 20).map(slim) };
+}
+
+// lyrics of the song in the captured tab, for the audio alignment in the offscreen document
+let activeLyrics = null; // {tabId, videoId, lyrics, synced}
+
+async function sendVideoDelay(tabId, seconds) {
+	try {
+		await chrome.tabs.sendMessage(tabId, { type: 'video-delay', seconds });
+	} catch (e) {
+		// no content script in that tab
+	}
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+	if (msg.target !== 'background') return false;
+	(async () => {
+		switch (msg.type) {
+			case 'open-update':
+				await chrome.tabs.create({ url: chrome.runtime.getURL('update/update.html') });
+				return { ok: true };
+			case 'update-check':
+				return runUpdateCheck({ manual: true });
+			// the key control in the YouTube page (above the lyrics): only for the tab that is
+			// being processed (the icon click that starts it is what grants access to the tab)
+			case 'key-get': {
+				const state = await getState();
+				const s = await loadSettings();
+				return { ok: true, active: !!(state.active && sender.tab && state.tabId === sender.tab.id), semitones: s.semitones, mode: s.mode, bypass: s.bypass };
+			}
+			case 'key-set':
+				return keyFromPage(sender.tab && sender.tab.id, msg.value);
+			case 'start':
+				return start(msg.tabId);
+			case 'stop':
+				return stop();
+			case 'state':
+				return getState();
+			case 'settings':
+				return applySettings(msg.settings);
+			case 'latency': {
+				// from offscreen: total audio delay changed
+				await chrome.storage.session.set({ latency: msg.seconds });
+				const state = await getState();
+				const settings = await loadSettings();
+				if (state.active && state.tabId != null) {
+					await sendVideoDelay(state.tabId, settings.videoSync ? msg.seconds : 0);
+					await sendToTab(state.tabId, { type: 'audio-delay', seconds: msg.seconds });
+				}
+				return { ok: true };
+			}
+			case 'lyrics-find':
+				return findLyrics(msg);
+			// the watch page's data (description, comments token): read here, not in the page,
+			// where reading a page of that size is a hitch for the playing video
+			// the diagnostics file: what the audio analysis is doing (speech recognition runs,
+			// errors, mode), for the tab being processed
+			case 'diag-status': {
+				const state = await getState();
+				if (!state.active || !sender.tab || sender.tab.id !== state.tabId) return { active: false };
+				const r = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'status' }).catch(() => null);
+				const st = r && r.status ? { ...r.status } : null;
+				if (st && st.melody) delete st.melody;
+				return { active: true, status: st, version: chrome.runtime.getManifest().version };
+			}
+			case 'yt-parse':
+				return KCL.ytData.parseWatch(String(msg.html || ''));
+			case 'lyrics-search':
+				return searchLyrics(msg);
+			case 'lyrics-get':
+				return slim(await getRecord(msg.id));
+			case 'lyrics-choose': {
+				const c = (await cachedLyrics(msg.videoId)) || { candidates: [] };
+				await cacheLyrics(msg.videoId, { ...c, best: slim(msg.rec) });
+				return { ok: true };
+			}
+			case 'audio-delay-get': {
+				const state = await getState();
+				const { latency = 0 } = await chrome.storage.session.get('latency');
+				return { delay: state.active && sender.tab && sender.tab.id === state.tabId ? latency : 0 };
+			}
+			case 'lyrics-active': {
+				activeLyrics = sender.tab ? { tabId: sender.tab.id, videoId: msg.videoId, lyrics: msg.lyrics, synced: msg.synced } : null;
+				const state = await getState();
+				if (state.active && sender.tab && state.tabId === sender.tab.id) {
+					await chrome.runtime.sendMessage({ target: 'offscreen', type: 'lyrics', lyrics: activeLyrics }).catch(() => {});
+				}
+				return { ok: true };
+			}
+			case 'lyrics-need': {
+				// the lyrics panel says what analysis it needs (only the captured tab can have it)
+				const state = await getState();
+				if (!state.active || !sender.tab || sender.tab.id !== state.tabId) return { ok: true, analysing: false, capturing: false };
+				const r = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'lyrics-need', ...msg.need }).catch(() => null);
+				return { ok: true, analysing: !!(r && r.analysing), capturing: true };
+			}
+			case 'lyrics-event': {
+				// from the offscreen analysis: alignment / heard lines, for the captured tab
+				const state = await getState();
+				if (state.tabId != null) await sendToTab(state.tabId, msg.event);
+				return { ok: true };
+			}
+			case 'sep-profile':
+				await chrome.storage.local.set({ sepProfile: { ...msg.profile, version: chrome.runtime.getManifest().version, at: Date.now() } });
+				return { ok: true };
+			case 'ended':
+				// captured tab closed or capture stopped by Chrome
+				return stop();
+		}
+	})().then(
+		(r) => sendResponse(r ?? { ok: true }),
+		(e) => sendResponse({ ok: false, error: String(e && e.message || e) }),
+	);
+	return true;
+});
+
+chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
+	const state = await getState();
+	if (!state.active || state.tabId !== tabId) return;
+	// the processed sound plays from the offscreen document: follow the tab's mute button
+	if (info.mutedInfo) {
+		await chrome.runtime.sendMessage({ target: 'offscreen', type: 'mute', muted: info.mutedInfo.muted }).catch(() => {});
+	}
+	// another song in the captured tab (YouTube changes the URL without reloading)
+	if (info.url || (info.title && state.song && !state.song.title)) {
+		const song = { id: songIdFromUrl(tab.url || ''), title: cleanTitle(tab.title), url: tab.url || '' };
+		if (info.url && song.id !== (state.song && state.song.id)) {
+			await chrome.runtime.sendMessage({ target: 'offscreen', type: 'new-song' }).catch(() => {});
+			const before = await loadSettings();
+			const settings = await restoreKey(before, song);
+			if (settings.semitones !== before.semitones) {
+				await chrome.runtime.sendMessage({ target: 'offscreen', type: 'settings', settings }).catch(() => {});
+			}
+		}
+		await setState({ ...state, song });
+	}
+	// after a reload / page change the page script is gone: put it back and re-apply the video delay
+	if (info.status === 'complete') {
+		const settings = await loadSettings();
+		if (settings.videoSync) await injectVideoSync(tabId);
+	}
+});
+
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+	const state = await getState();
+	if (state.active && state.tabId === tabId) await stop();
+});
+
+// keyboard shortcuts (work without opening the panel)
+chrome.commands.onCommand.addListener((command) => {
+	// queued, so that holding a shortcut down steps the key once per press
+	commandQueue = commandQueue.then(() => runCommand(command)).catch(() => {});
+});
+let commandQueue = Promise.resolve();
+
+// same queue as the keyboard shortcuts: one change after the other, the last one wins
+function keyFromPage(tabId, value) {
+	const run = commandQueue.then(async () => {
+		const state = await getState();
+		if (!state.active || tabId == null || state.tabId !== tabId) return { ok: false, active: false };
+		const settings = await loadSettings();
+		settings.semitones = Math.max(-12, Math.min(12, Math.round(Number(value) || 0)));
+		await saveSettings(settings);
+		await applySettings(settings);
+		return { ok: true, active: true, semitones: settings.semitones };
+	});
+	commandQueue = run.catch(() => {});
+	return run;
+}
+
+async function runCommand(command) {
+	const state = await getState();
+	if (!state.active) return;
+	const settings = await loadSettings();
+	if (command === 'key-up') settings.semitones = Math.min(12, settings.semitones + 1);
+	else if (command === 'key-down') settings.semitones = Math.max(-12, settings.semitones - 1);
+	else if (command === 'toggle-bypass') settings.bypass = !settings.bypass;
+	else return;
+	await saveSettings(settings);
+	await applySettings(settings);
+}
+
+// After an update (or a reload) the pages already open still run the page scripts of the
+// version before, cut off from the extension: those take themselves off the page, and the
+// new ones are put in here, so the lyrics carry on without reloading the page.
+async function injectIntoOpenTabs() {
+	for (const cs of chrome.runtime.getManifest().content_scripts || []) {
+		let tabs = [];
+		try {
+			tabs = await chrome.tabs.query({ url: cs.matches });
+		} catch (e) {
+			continue;
+		}
+		for (const t of tabs) {
+			// (a page still loading gets the page scripts the normal way when it is ready)
+			if (!t.id || t.discarded || t.status !== 'complete') continue;
+			try {
+				await chrome.scripting.executeScript({ target: { tabId: t.id, allFrames: !!cs.all_frames }, files: cs.js });
+			} catch (e) {
+				// a page that cannot be scripted (still loading, an error page)
+			}
+		}
+	}
+}
+
+// Once per run of the extension (installed, updated, reloaded, turned back on: the session
+// storage starts empty each time): the page scripts into the pages already open, and the
+// saved lyrics settings in their current form.
+async function sessionStart() {
+	const { started } = await chrome.storage.session.get('started');
+	if (started) return;
+	await chrome.storage.session.set({ started: Date.now() });
+	await migratePrefs().catch(() => {});
+	await injectIntoOpenTabs();
+}
+// lyrics settings per video were one big object ("lyricsPrefs"); now one item per video
+async function migratePrefs() {
+	const { lyricsPrefs } = await chrome.storage.local.get('lyricsPrefs');
+	if (!lyricsPrefs) return;
+	const items = {}, index = {};
+	for (const [id, v] of Object.entries(lyricsPrefs)) {
+		if (!v || typeof v !== 'object') continue;
+		items['lp:' + id] = v;
+		index[id] = v.at || 0;
+	}
+	const { lyricsPrefsIndex = {} } = await chrome.storage.local.get('lyricsPrefsIndex');
+	await chrome.storage.local.set({ ...items, lyricsPrefsIndex: { ...index, ...lyricsPrefsIndex } });
+	await chrome.storage.local.remove('lyricsPrefs');
+}
+sessionStart();
+
+chrome.runtime.onInstalled.addListener(async ({ reason }) => {
+	if (reason === 'install') chrome.tabs.create({ url: chrome.runtime.getURL('welcome/welcome.html') });
+	await updateBadge(await getState());
+});
+
+chrome.runtime.onStartup.addListener(async () => {
+	// capture never survives a browser restart
+	await setState({ active: false, tabId: null });
+});
+
+// handle for debugging from the service worker console and for test/browser-test.mjs
+self.keyChanger = { start, stop, applySettings, getState, updater, runUpdateCheck };
