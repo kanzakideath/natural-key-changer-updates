@@ -1,0 +1,245 @@
+// More lyrics databases besides LRCLIB: NetEase Cloud Music and QQ Music. Both hold timed
+// lyrics for a great many Japanese / VOCALOID / anime songs that LRCLIB does not have (e.g.
+// 臨界ダイバー), and they keep answering when LRCLIB is overloaded.
+//
+// Records are made to look like LRCLIB's ({id, trackName, artistName, albumName, duration,
+// syncedLyrics, plainLyrics}) so the same scoring picks among all of them. The id carries the
+// source: "ne:<id>", "qq:<mid>". Searches give names only; the lyrics of the few best are
+// fetched afterwards (`fill`).
+// Classic script (content scripts cannot be modules): everything hangs off globalThis.KCL.
+(function (root) {
+	const KCL = (root.KCL = root.KCL || {});
+	const NE = 'https://interface.music.163.com/api/';
+	const QQ = 'https://u.y.qq.com/cgi-bin/musicu.fcg?data=';
+	const HAN = /[㐀-鿿]/, KANA = /[぀-ヿ]/, HANGUL = /[가-힯]/;
+
+	// "アイドル (偶像)" / "爱缪 (あいみょん)": a Chinese translation (or the original) in
+	// brackets. Returns [main, alias]
+	function splitTranslation(s) {
+		const m = /^(.*\S)\s+[(（]([^()（）]+)[)）]$/.exec(String(s || '').trim());
+		if (!m) return [String(s || '').trim(), null];
+		const [, a, b] = m;
+		// (Live), (Inst.), (TV Size) and the like are part of the name
+		if (!HAN.test(b) && !KANA.test(b) && !HANGUL.test(b)) return [String(s).trim(), null];
+		// the translation is the han-only part; the other one is the name
+		if (HAN.test(b) && !KANA.test(b) && !HANGUL.test(b) && (KANA.test(a) || /[a-z]/i.test(a) || HANGUL.test(a))) return [a, b];
+		// "爱缪 (あいみょん)": a Chinese name with the original in brackets
+		if ((KANA.test(b) || HANGUL.test(b)) && !KANA.test(a) && HAN.test(a)) return [b, a];
+		return [a, b];
+	}
+
+	// "新時代 (ウタ from ONE PIECE FILM RED)" / "ヒバナ -Reloaded-": the name without what is
+	// added to it (another name to match by; a version stays visible in the full name)
+	function baseNames(name) {
+		const out = [];
+		const m = /^(.+?)\s*(?:[(（\[［【][^()（）\[\]［］【】]*[)）\]］】]|\s[-–—~〜][^-–—~〜]+[-–—~〜]?)\s*$/.exec(String(name || '').trim());
+		if (m && m[1].length >= 1 && m[1] !== name) out.push(m[1].trim());
+		return out;
+	}
+
+	// ---------------------------------------------------------------- lyrics text
+	// Credit lines that open (or close) these lyrics, not sung: "作词 : X", "【曲名】作…X",
+	// "Lyrics by", "未经许可…", "QQ音乐享有…".
+	const CREDIT = /^\s*(作词|作曲|编曲|編曲|作詞|作編曲|词|曲|制作人|製作|制作|监制|監修|混音|混缩|母带|录音|錄音|和声|和聲|吉他|贝斯|貝斯|鼓|键盘|弦乐|合成器|出品|发行|發行|企划|策划|统筹|演唱|原唱|歌|唄|vocal|vo\.?|lyrics?|lyricist|words|music|composer|composed|arranger|arranged|arrangement|producer|produced|mix(ed|ing)?|master(ed|ing)?|illust(ration)?|movie|video|guitar|bass|drums?|piano|chorus|op|sp|isrc|tme|by)\s*(by)?\s*[:：/／]/i;
+	const NOTICE = /(未经|未經|著作权|著作權|版权|版權|QQ音乐|QQ音樂|网易云|網易雲|酷狗|享有本翻译|翻译作品)|^\s*【[^】]*】\s*(作|詞|曲|唄|歌)|^\s*(纯音乐|純音樂)，?请欣赏|^\s*[-—–]?\s*end\s*[-—–]?\s*$/i;
+	function clean(lrc, { title = '', artist = '' } = {}) {
+		if (!lrc) return { synced: null, plain: null, instrumental: false };
+		const text = String(lrc).replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n))).replace(/&apos;/g, "'").replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+		if (/^\s*(\[[^\]]*\]\s*)*(纯音乐|純音樂)，?请欣赏/m.test(text) && text.replace(/\[[^\]]*\]/g, '').trim().length < 40) return { synced: null, plain: null, instrumental: true };
+		const rows = text.split(/\r?\n/);
+		const timed = rows.filter((r) => /^\s*\[\d{1,3}:\d{1,2}(?:[.:]\d{1,3})?\]/.test(r));
+		const words = (r) => r.replace(/\[[^\]]*\]/g, '').trim();
+		const t0 = (r) => { const m = /\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]/.exec(r); return m ? Number(m[1]) * 60 + Number(m[2]) : 0; };
+		const ct = KCL.compact ? KCL.compact : (x) => x.toLowerCase().replace(/\s+/g, '');
+		const headerLike = (w) => !w || CREDIT.test(w) || NOTICE.test(w) || (title && ct(w).includes(ct(title)) && /[-–—\/／]|作|唄|歌/.test(w) && w.length < 60) || (artist && title && ct(w) === ct(title + artist));
+		const strip = (list, timedList) => {
+			let a = 0, b = list.length;
+			// credits sit at the very start (before the singing) and at the very end
+			while (a < b && (headerLike(words(list[a])) || /^\s*\[(ar|ti|al|by|offset|length|re|ve|au|kana):/i.test(list[a]))) a++;
+			while (b > a && headerLike(words(list[b - 1]))) b--;
+			let out = list.slice(a, b);
+			// a credit line in the middle (rare): only when it is clearly one
+			out = out.filter((r) => !(NOTICE.test(words(r)) || (timedList && CREDIT.test(words(r)) && t0(r) < 15)));
+			return out;
+		};
+		if (timed.length >= 4) {
+			const kept = strip(timed, true);
+			const sung = kept.filter((r) => words(r));
+			if (sung.length < 3) return { synced: null, plain: null, instrumental: sung.length === 0 };
+			// all lines at 0:00 = no times really
+			const times = new Set(sung.map(t0));
+			if (times.size <= 2) return { synced: null, plain: sung.map(words).join('\n'), instrumental: false };
+			return { synced: kept.join('\n'), plain: sung.map(words).join('\n'), instrumental: false };
+		}
+		const kept = strip(rows.map((r) => r.trim()), false).map(words);
+		const sung = kept.filter(Boolean);
+		return { synced: null, plain: sung.length >= 3 ? kept.join('\n').trim() : null, instrumental: false };
+	}
+
+	function b64utf8(s) {
+		const bin = atob(String(s || ''));
+		const bytes = new Uint8Array(bin.length);
+		for (let i = 0; i < bin.length; ++i) bytes[i] = bin.charCodeAt(i);
+		return new TextDecoder().decode(bytes);
+	}
+
+	// ---------------------------------------------------------------- searches
+	async function searchNE(q, fetchJson) {
+		const j = await fetchJson(NE + 'cloudsearch/pc?' + new URLSearchParams({ s: q, type: '1', limit: '12', offset: '0' }).toString());
+		const songs = (j && j.result && j.result.songs) || [];
+		return songs.map((s) => {
+			const ar = s.ar || s.artists || [];
+			return {
+				id: 'ne:' + s.id,
+				db: 'netease',
+				trackName: s.name || '',
+				trackAliases: baseNames(s.name),
+				artistName: ar.map((a) => a.name).filter(Boolean).join(', '),
+				artistAliases: ar.flatMap((a) => [...(a.alia || []), ...(a.alias || []), ...(a.tns || [])]).filter(Boolean),
+				albumName: (s.al || s.album || {}).name || '',
+				duration: Math.round((s.dt || s.duration || 0) / 1000),
+				syncedLyrics: null,
+				plainLyrics: null,
+				lazy: true,
+			};
+		});
+	}
+	async function searchQQ(q, fetchJson) {
+		// the older search (answers without a login); the newer one as a second try
+		let list = [];
+		try {
+			const j = await fetchJson('https://c.y.qq.com/soso/fcgi-bin/client_search_cp?' + new URLSearchParams({ w: q, format: 'json', n: '12', p: '1', cr: '1' }).toString());
+			list = ((j && j.data && j.data.song && j.data.song.list) || []).map((s) => ({ mid: s.songmid, title: s.songname, singer: s.singer, interval: s.interval, album: s.albumname }));
+		} catch (e) { list = []; }
+		if (!list.length) {
+			const data = { req: { method: 'DoSearchForQQMusicDesktop', module: 'music.search.SearchCgiService', param: { query: q, num_per_page: 12, page_num: 1, search_type: 0 } } };
+			const j = await fetchJson(QQ + encodeURIComponent(JSON.stringify(data)));
+			list = ((j && j.req && j.req.data && j.req.data.body && j.req.data.body.song && j.req.data.body.song.list) || []).map((s) => ({ mid: s.mid, title: s.title || s.name, singer: s.singer, interval: s.interval, album: s.album && s.album.name }));
+		}
+		return list.filter((s) => s.mid).map((s) => {
+			const [name, tr] = splitTranslation(s.title || '');
+			const singers = (s.singer || []).map((x) => splitTranslation(x.name || x.title || ''));
+			return {
+				id: 'qq:' + s.mid,
+				db: 'qq',
+				trackName: name,
+				trackAliases: [...(tr ? [tr] : []), ...baseNames(name)],
+				artistName: singers.map((x) => x[0]).join(', '),
+				artistAliases: singers.map((x) => x[1]).filter(Boolean),
+				albumName: s.album || '',
+				duration: s.interval || 0,
+				syncedLyrics: null,
+				plainLyrics: null,
+				lazy: true,
+			};
+		});
+	}
+
+	// the lyrics of one record (in place); false when there are none
+	async function fill(rec, fetchJson) {
+		if (!rec || !rec.lazy) return !!(rec && (rec.syncedLyrics || rec.plainLyrics));
+		let raw = null;
+		if (rec.id.startsWith('ne:')) {
+			const id = rec.id.slice(3);
+			const j = await fetchJson(NE + 'song/lyric?' + new URLSearchParams({ id, lv: '1', tv: '-1' }).toString());
+			raw = j && j.lrc && j.lrc.lyric;
+			if (j && (j.nolyric || j.uncollected)) raw = null;
+		} else if (rec.id.startsWith('qq:')) {
+			const data = { req: { method: 'GetPlayLyricInfo', module: 'music.musichallSong.PlayLyricInfo', param: { songMID: rec.id.slice(3) } } };
+			const j = await fetchJson(QQ + encodeURIComponent(JSON.stringify(data)));
+			const d = j && j.req && j.req.data;
+			if (d && d.lyric) {
+				try { raw = b64utf8(d.lyric); } catch (e) { raw = null; }
+			}
+		}
+		const c = clean(raw, { title: rec.trackName, artist: rec.artistName });
+		rec.syncedLyrics = c.synced;
+		rec.plainLyrics = c.plain;
+		rec.instrumental = c.instrumental;
+		rec.lazy = false;
+		return !!(c.synced || c.plain);
+	}
+
+	// one record by id (a choice remembered for a video)
+	async function get(id, fetchJson) {
+		id = String(id);
+		const rec = { id, db: id.startsWith('ne:') ? 'netease' : 'qq', trackName: '', artistName: '', albumName: '', duration: 0, syncedLyrics: null, plainLyrics: null, lazy: true };
+		try {
+			if (id.startsWith('ne:')) {
+				const j = await fetchJson(NE + 'song/detail?' + new URLSearchParams({ ids: `[${id.slice(3)}]` }).toString());
+				const s = j && j.songs && j.songs[0];
+				if (s) Object.assign(rec, { trackName: s.name || '', artistName: (s.ar || s.artists || []).map((a) => a.name).join(', '), albumName: (s.al || s.album || {}).name || '', duration: Math.round((s.dt || s.duration || 0) / 1000) });
+			}
+		} catch (e) { /* names are only for show */ }
+		if (!(await fill(rec, fetchJson))) return null;
+		return rec;
+	}
+
+	const isSourceId = (id) => /^(ne|qq):/.test(String(id || ''));
+
+	// What to ask: the most likely song (+ artist) readings of the video title
+	function queries(parsed, extra = []) {
+		const out = [];
+		const add = (q) => {
+			q = String(q || '').replace(/\s+/g, ' ').trim();
+			if (q.length >= 2 && !out.some((x) => x.toLowerCase() === q.toLowerCase())) out.push(q);
+		};
+		for (const q of extra) add(q);
+		const pairs = parsed.pairs.filter((p) => p.title);
+		for (const p of pairs.filter((x) => x.artist).slice(0, 2)) add(`${p.title} ${p.artist}`);
+		for (const t of parsed.titles.slice(0, 2)) add(t);
+		return out.slice(0, 3);
+	}
+
+	// Adds the records of both services to `pool` (Map id -> record with .match), then fetches
+	// the lyrics of the best few. `scoreOf(rec, assumeSynced)` scores a record.
+	async function extend(pool, parsed, fetchJson, scoreOf, { extra = [], fetchTop = 4 } = {}) {
+		const qs = queries(parsed, extra);
+		const jobs = [];
+		for (const q of qs) {
+			jobs.push(searchNE(q, fetchJson).catch(() => []));
+			jobs.push(searchQQ(q, fetchJson).catch(() => []));
+		}
+		const found = (await Promise.all(jobs)).flat();
+		const fresh = [];
+		for (const r of found) {
+			if (pool.has(r.id)) continue;
+			r.match = scoreOf(r, true);
+			if (r.match.titleScore < 0.7) continue;
+			pool.set(r.id, r);
+			fresh.push(r);
+		}
+		// lyrics for the best few (one record per name / artist / length: the same song is often
+		// listed several times; a TV-size or other cut of it is another record)
+		fresh.sort((a, b) => b.match.score - a.match.score);
+		// no singer to go by (a cover's title): the singer most of these records are by first -
+		// the original (the others are covers of it)
+		if (fresh.length && fresh.every((r) => r.match.artistScore < 0.5)) {
+			const first = (r) => (KCL.compact || ((x) => x))(String(r.artistName || '').split(/\s*(?:,|、|&|＆|\/|feat\.?|ft\.|×)\s*/i)[0]);
+			const votes = new Map();
+			for (const r of fresh) if (r.match.titleScore >= 0.95) votes.set(first(r), (votes.get(first(r)) || 0) + 1);
+			fresh.sort((a, b) => (votes.get(first(b)) || 0) - (votes.get(first(a)) || 0) || b.match.score - a.match.score);
+		}
+		const picked = [];
+		const seen = new Map();
+		for (const r of fresh) {
+			const k = (KCL.compact ? KCL.compact(r.trackName + '|' + r.artistName) : r.trackName + '|' + r.artistName) + '|' + r.db + '|' + Math.round((r.duration || 0) / 8);
+			if ((seen.get(k) || 0) >= 1) continue;
+			seen.set(k, 1);
+			picked.push(r);
+			if (picked.length >= fetchTop) break;
+		}
+		await Promise.all(picked.map(async (r) => {
+			let ok = false;
+			try { ok = await fill(r, fetchJson); } catch (e) { ok = false; }
+			if (!ok) pool.delete(r.id);
+			else r.match = scoreOf(r, false);
+		}));
+		// the rest stay as names only (they can still be picked by hand: their lyrics are
+		// fetched then), ranked below everything with lyrics
+		for (const r of fresh) if (r.lazy && pool.has(r.id)) r.match = { ...r.match, score: r.match.score - 0.6 };
+		return { queries: qs.length * 2, fetched: picked.length };
+	}
+
+	KCL.sources = { searchNE, searchQQ, fill, get, extend, clean, splitTranslation, isSourceId, queries };
+})(globalThis);
